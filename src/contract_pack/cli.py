@@ -9,12 +9,21 @@ from rich.console import Console
 from rich.table import Table
 
 from . import __version__
-from .config import AppConfig
+from .config import AppConfig, PackageConfig
 from .engine import Engine
 from .manifest import load_manifest
-from .precheck import run_precheck
+from .precheck import PrecheckIssue, run_precheck
 from .report import export_csv, export_json
 from .storage import BATCH_STATUS, BatchStorage
+from .template import (
+    TemplateApplyError,
+    TemplateNameExistsError,
+    TemplateNotFoundError,
+    TemplateStorage,
+    apply_template,
+    export_template_csv,
+    export_template_json,
+)
 
 
 console = Console()
@@ -290,6 +299,271 @@ def export(ctx: click.Context, config_path: str | None, fmt: str, output_path: s
     else:
         export_csv(batches, out)
     console.print(f"[green]已导出 {len(batches)} 个批次到 {out}[/green]")
+
+
+def _print_issues(issues: list[PrecheckIssue]):
+    errors = [i for i in issues if i.level == "error"]
+    warnings = [i for i in issues if i.level == "warning"]
+    if errors:
+        table = Table(title="错误", show_lines=False)
+        table.add_column("级别", style="red")
+        table.add_column("类型")
+        table.add_column("包")
+        table.add_column("消息")
+        table.add_column("详情")
+        for i in errors:
+            table.add_row(i.level, i.kind, i.package, i.message, i.detail or "")
+        console.print(table)
+    if warnings:
+        table = Table(title="警告", show_lines=False)
+        table.add_column("级别", style="yellow")
+        table.add_column("类型")
+        table.add_column("包")
+        table.add_column("消息")
+        table.add_column("详情")
+        for i in warnings:
+            table.add_row(i.level, i.kind, i.package, i.message, i.detail or "")
+        console.print(table)
+
+
+@main.group("template")
+@click.pass_context
+def template_group(ctx: click.Context):
+    """交付方案模板管理 (保存/列出/查看/套用/导出/删除)"""
+    pass
+
+
+@template_group.command("save")
+@_config_option
+@click.argument("name")
+@click.pass_context
+def template_save(ctx: click.Context, config_path: str | None, name: str):
+    """将当前 YAML 配置的 packages / file_mapping / zip 规则保存为命名模板"""
+    cfg = _get_cfg(ctx, config_path)
+    base_dir = Path(cfg.db_path).parent
+
+    rel_packages = []
+    for pkg in cfg.packages:
+        try:
+            rel_out = pkg.output_dir.relative_to(base_dir)
+        except ValueError:
+            rel_out = Path(pkg.output_dir.name)
+        rel_zip = None
+        if pkg.zip_output:
+            try:
+                rel_zip = pkg.zip_output.relative_to(base_dir)
+            except ValueError:
+                rel_zip = Path(pkg.zip_output.name)
+        rel_packages.append(
+            PackageConfig(
+                name=pkg.name,
+                output_dir=rel_out,
+                zip_output=rel_zip,
+                file_mapping=dict(pkg.file_mapping),
+                version=pkg.version,
+            )
+        )
+
+    storage = TemplateStorage(cfg.db_path)
+    try:
+        tpl = storage.save_template(
+            name=name,
+            packages=rel_packages,
+            source_config_summary=cfg.summary(),
+        )
+    except TemplateNameExistsError as e:
+        console.print(f"[red]保存失败: {e}[/red]")
+        console.print("[yellow]提示: 使用 'contract-pack template list' 查看已有模板，或使用其他名称。[/yellow]")
+        ctx.exit(5)
+    except ValueError as e:
+        console.print(f"[red]保存失败: {e}[/red]")
+        ctx.exit(5)
+    console.print(f"[green]模板已保存:[/green] {tpl.name} (创建于 {tpl.created_at})")
+    console.print(f"  包含 {len(tpl.packages)} 个包: {', '.join(p.name for p in tpl.packages)}")
+
+
+@template_group.command("list")
+@_config_option
+@click.pass_context
+def template_list_cmd(ctx: click.Context, config_path: str | None):
+    """列出所有已保存的交付方案模板"""
+    cfg = _get_cfg(ctx, config_path)
+    storage = TemplateStorage(cfg.db_path)
+    templates = storage.list_templates()
+    if not templates:
+        console.print("[yellow]暂无保存的模板[/yellow]")
+        console.print("[yellow]提示: 使用 'contract-pack template save <名称>' 保存当前配置为模板。[/yellow]")
+        return
+    table = Table(title=f"已保存的模板 ({len(templates)} 个)")
+    table.add_column("模板名")
+    table.add_column("创建时间")
+    table.add_column("包数量")
+    table.add_column("包列表", overflow="fold")
+    for tpl in templates:
+        table.add_row(
+            tpl.name,
+            tpl.created_at,
+            str(len(tpl.packages)),
+            ", ".join(p.name for p in tpl.packages),
+        )
+    console.print(table)
+
+
+@template_group.command("show")
+@_config_option
+@click.argument("name")
+@click.pass_context
+def template_show(ctx: click.Context, config_path: str | None, name: str):
+    """查看指定模板的详细信息"""
+    cfg = _get_cfg(ctx, config_path)
+    storage = TemplateStorage(cfg.db_path)
+    tpl = storage.get_template(name)
+    if not tpl:
+        console.print(f"[red]模板不存在: {name}[/red]")
+        console.print("[yellow]提示: 使用 'contract-pack template list' 查看已有模板。[/yellow]")
+        ctx.exit(1)
+    console.print(f"[bold]模板名[/bold]: {tpl.name}")
+    console.print(f"[bold]ID[/bold]: {tpl.id}")
+    console.print(f"[bold]创建时间[/bold]: {tpl.created_at}")
+    console.print(f"[bold]来源配置摘要[/bold]:")
+    for k, v in tpl.source_config_summary.items():
+        if k != "packages":
+            console.print(f"  {k}: {v}")
+    if tpl.packages:
+        table = Table(title="包配置")
+        table.add_column("包名")
+        table.add_column("输出目录", overflow="fold")
+        table.add_column("zip 输出", overflow="fold")
+        table.add_column("版本")
+        table.add_column("file_mapping", overflow="fold", max_width=50)
+        for pkg in tpl.packages:
+            table.add_row(
+                pkg.name,
+                str(pkg.output_dir),
+                str(pkg.zip_output) if pkg.zip_output else "-",
+                pkg.version or "-",
+                str(pkg.file_mapping) if pkg.file_mapping else "-",
+            )
+        console.print(table)
+
+
+@template_group.command("delete")
+@_config_option
+@click.argument("name")
+@click.option("--force", is_flag=True, help="不确认直接删除")
+@click.pass_context
+def template_delete(ctx: click.Context, config_path: str | None, name: str, force: bool):
+    """删除指定模板"""
+    cfg = _get_cfg(ctx, config_path)
+    storage = TemplateStorage(cfg.db_path)
+    tpl = storage.get_template(name)
+    if not tpl:
+        console.print(f"[red]模板不存在: {name}[/red]")
+        ctx.exit(1)
+    if not force:
+        console.print(f"[yellow]即将删除模板: {name} (包含 {len(tpl.packages)} 个包)[/yellow]")
+        confirmed = click.confirm("确认删除？", default=False)
+        if not confirmed:
+            console.print("已取消")
+            return
+    deleted = storage.delete_template(name)
+    if deleted:
+        console.print(f"[green]模板已删除: {name}[/green]")
+    else:
+        console.print(f"[red]删除失败: {name}[/red]")
+        ctx.exit(1)
+
+
+@template_group.command("export")
+@_config_option
+@click.option("--format", "-f", "fmt", type=click.Choice(["json", "csv"]), default="json", show_default=True, help="导出格式")
+@click.option("--output", "-o", "output_path", required=True, help="输出文件路径")
+@click.argument("name", required=False)
+@click.pass_context
+def template_export(ctx: click.Context, config_path: str | None, fmt: str, output_path: str, name: str | None):
+    """导出模板为 JSON 或 CSV，包含模板名、来源配置摘要和创建时间"""
+    cfg = _get_cfg(ctx, config_path)
+    storage = TemplateStorage(cfg.db_path)
+    if name:
+        tpl = storage.get_template(name)
+        if not tpl:
+            console.print(f"[red]模板不存在: {name}[/red]")
+            ctx.exit(1)
+        templates = [tpl]
+    else:
+        templates = storage.list_templates()
+    if not templates:
+        console.print("[yellow]没有可导出的模板[/yellow]")
+        ctx.exit(1)
+    out = Path(output_path)
+    try:
+        if fmt == "json":
+            export_template_json(templates, out)
+        else:
+            export_template_csv(templates, out)
+    except (PermissionError, OSError) as e:
+        console.print(f"[red]导出失败: {e}（可能是只读目录或权限不足）[/red]")
+        ctx.exit(1)
+    console.print(f"[green]已导出 {len(templates)} 个模板到 {out}[/green]")
+
+
+@template_group.command("apply")
+@_config_option
+@click.argument("template_name")
+@click.option("--manifest", "-m", "manifest_path", required=True, help="新的 CSV 清单文件路径")
+@click.option("--output", "-o", "output_path", required=True, help="生成的 YAML 配置草稿输出路径")
+@click.option("--source-root", "source_root", default=None, help="新的 source_root (默认: ./sources)")
+@click.option("--operator", "operator", default=None, help="操作者 (默认从环境变量读取)")
+@click.option("--db-path", "db_path", default=None, help="新的 db_path (默认: ./.contract_pack.db)")
+@click.option("--skip-dry-run", is_flag=True, help="跳过 dry-run 验证（不推荐）")
+@click.pass_context
+def template_apply(
+    ctx: click.Context,
+    config_path: str | None,
+    template_name: str,
+    manifest_path: str,
+    output_path: str,
+    source_root: str | None,
+    operator: str | None,
+    db_path: str | None,
+    skip_dry_run: bool,
+):
+    """套用模板 + 新 CSV 清单生成配置草稿，默认自动 dry-run 验证"""
+    cfg = _get_cfg(ctx, config_path)
+    storage = TemplateStorage(cfg.db_path)
+    tpl = storage.get_template(template_name)
+    if not tpl:
+        console.print(f"[red]模板不存在: {template_name}[/red]")
+        console.print("[yellow]提示: 使用 'contract-pack template list' 查看已有模板。[/yellow]")
+        ctx.exit(1)
+
+    console.print(f"套用模板 [bold]{tpl.name}[/bold] 生成配置草稿...")
+    console.print(f"  清单: {manifest_path}")
+    console.print(f"  输出: {output_path}")
+
+    try:
+        generated, precheck_result = apply_template(
+            template=tpl,
+            manifest_path=Path(manifest_path),
+            output_config_path=Path(output_path),
+            source_root=Path(source_root) if source_root else None,
+            operator=operator,
+            db_path=Path(db_path) if db_path else None,
+            run_dry_run=not skip_dry_run,
+        )
+    except TemplateApplyError as e:
+        console.print(f"[red]模板套用失败: {e}[/red]")
+        if e.issues:
+            _print_issues(e.issues)
+        console.print("[yellow]提示: 数据库状态未被修改，可修复问题后重试。[/yellow]")
+        ctx.exit(6)
+
+    console.print(f"[green]配置草稿已生成:[/green] {generated}")
+    if not skip_dry_run:
+        console.print(f"  dry-run 通过，条目数: {sum(len(v) for v in precheck_result.plan.values())}")
+        if precheck_result.warnings:
+            _print_issues(precheck_result.warnings)
+    console.print("[yellow]提示: 请检查生成的配置，确认后使用 'contract-pack dry-run' 再验证，然后 'contract-pack run' 执行。[/yellow]")
 
 
 if __name__ == "__main__":
