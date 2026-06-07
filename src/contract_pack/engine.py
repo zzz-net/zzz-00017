@@ -71,7 +71,9 @@ class Engine:
         result = EngineResult(batch_id=batch.id, status=BATCH_STATUS["FAILED"])
 
         if not precheck.ok and not force:
-            err = f"预检失败: 存在 {len(precheck.errors)} 个错误"
+            issue_lines = [f"[{e.level}/{e.kind}] {e.package}: {e.message}" for e in precheck.errors]
+            detail = "；".join(issue_lines) if issue_lines else ""
+            err = f"预检失败: 存在 {len(precheck.errors)} 个错误 — {detail}" if detail else f"预检失败: 存在 {len(precheck.errors)} 个错误"
             self.storage.update_batch_status(batch.id, BATCH_STATUS["FAILED"], error=err, finished=True)
             result.error = err
             return result
@@ -97,6 +99,7 @@ class Engine:
                         target_path=str(tgt),
                         category=entry.category,
                         status=FILE_STATUS["PENDING"],
+                        version=entry.version,
                     )
                     try:
                         if not src.exists():
@@ -371,7 +374,7 @@ def rebuild_manifest_from_batch(batch: Batch) -> List[ManifestEntry]:
                 category=fa.category,
                 source_path=fa.source_path,
                 target_name=tgt_name,
-                version=None,
+                version=getattr(fa, "version", None),
                 description="",
                 raw={"_rerun_from_batch": batch.id, "_fa_id": fa.id},
             )
@@ -439,7 +442,9 @@ def rerun_batch(
     precheck = run_precheck(new_cfg, entries, storage=new_storage, last_batch_id=parent_batch_id)
 
     if not precheck.ok and not force:
-        err = f"重跑预检失败: 存在 {len(precheck.errors)} 个错误"
+        issue_lines = [f"[{e.level}/{e.kind}] {e.package}: {e.message}" for e in precheck.errors]
+        detail = "；".join(issue_lines) if issue_lines else ""
+        err = f"重跑预检失败: 存在 {len(precheck.errors)} 个错误 — {detail}" if detail else f"重跑预检失败: 存在 {len(precheck.errors)} 个错误"
         dummy = new_storage.create_batch(
             operator=new_cfg.operator,
             config_summary=new_cfg.summary(),

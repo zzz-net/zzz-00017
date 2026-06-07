@@ -140,36 +140,33 @@ def run_precheck(config: AppConfig, entries: List[ManifestEntry], storage=None, 
 
             target_path = output_dir / target_name
 
-            if entry.version and target_path.exists():
+            if entry.version:
                 if storage and last_batch_id:
                     last = storage.get_batch(last_batch_id)
                     if last:
                         for fa in last.file_actions:
                             if fa.package == pkg.name and Path(fa.target_path).name == target_name:
-                                last_entry = None
-                                for le in grouped.get(pkg.name, []):
-                                    if Path(le.target_name or le.source_path).name == target_name:
-                                        last_entry = le
-                                        break
-                                if last_entry and last_entry.version:
-                                    if _parse_version(entry.version) < _parse_version(last_entry.version):
+                                parent_version = getattr(fa, "version", None)
+                                if parent_version:
+                                    if _parse_version(entry.version) < _parse_version(parent_version):
                                         result.issues.append(
                                             PrecheckIssue(
                                                 level="error",
                                                 kind="version_rollback",
                                                 package=pkg.name,
-                                                message=f"版本倒退: {target_name}",
-                                                detail=f"上次版本 {last_entry.version} >= 当前版本 {entry.version}",
+                                                message=f"版本倒退（父批次版本 {parent_version} > 当前 {entry.version}）: {target_name}",
+                                                detail=f"父批次 FileAction.version={parent_version}, 当前 manifest version={entry.version}",
                                             )
                                         )
+                                break
 
             if not config.allow_overwrite and target_path.exists():
                 result.issues.append(
                     PrecheckIssue(
-                        level="warning",
+                        level="error",
                         kind="target_exists",
                         package=pkg.name,
-                        message=f"目标文件已存在: {target_name}",
+                        message=f"目标文件已存在（allow_overwrite=False，拒绝覆盖）: {target_name}",
                         detail=f"路径: {target_path}",
                     )
                 )

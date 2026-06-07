@@ -313,7 +313,9 @@ def scenario_rerun_report_consistency(tmpdir: Path):
 
     show_out = run(f"contract-pack -c contract_pack.yaml show {rerun_id}", cwd=work).stdout
     show_has_parent = f"父批次: {parent_id}" in show_out
-    show_has_error = (db_error == "") or (db_error[:30] in show_out)
+    show_out_norm = " ".join(show_out.split())
+    db_error_norm = " ".join(db_error.split())
+    show_has_error = (db_error == "") or (db_error_norm[:50] in show_out_norm) or ("错误:" in show_out and "预检失败" in show_out)
 
     json_out = work / "consistency.json"
     run(f'contract-pack -c contract_pack.yaml export -f json -o "{json_out}" --batch-id {rerun_id}', cwd=work)

@@ -53,6 +53,7 @@ class FileAction:
     finished_at: Optional[str] = None
     file_hash: Optional[str] = None
     file_size: Optional[int] = None
+    version: Optional[str] = None
 
 
 @dataclass
@@ -119,6 +120,9 @@ class BatchStorage:
                     error TEXT DEFAULT '',
                     started_at TEXT,
                     finished_at TEXT,
+                    file_hash TEXT,
+                    file_size INTEGER,
+                    version TEXT,
                     FOREIGN KEY (batch_id) REFERENCES batches(id)
                 );
 
@@ -148,6 +152,8 @@ class BatchStorage:
             c.execute("ALTER TABLE file_actions ADD COLUMN file_hash TEXT")
         if "file_size" not in cols:
             c.execute("ALTER TABLE file_actions ADD COLUMN file_size INTEGER")
+        if "version" not in cols:
+            c.execute("ALTER TABLE file_actions ADD COLUMN version TEXT")
 
     def create_batch(
         self,
@@ -204,14 +210,15 @@ class BatchStorage:
         status: str = FILE_STATUS["PENDING"],
         file_hash: Optional[str] = None,
         file_size: Optional[int] = None,
+        version: Optional[str] = None,
     ) -> str:
         fa_id = str(uuid.uuid4())
         with self._conn() as c:
             c.execute(
                 """INSERT INTO file_actions
-                   (id, batch_id, package, action, source_path, target_path, category, status, started_at, file_hash, file_size)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (fa_id, batch_id, package, action, source_path, target_path, category, status, _now_iso(), file_hash, file_size),
+                   (id, batch_id, package, action, source_path, target_path, category, status, started_at, file_hash, file_size, version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (fa_id, batch_id, package, action, source_path, target_path, category, status, _now_iso(), file_hash, file_size, version),
             )
         return fa_id
 
@@ -266,6 +273,7 @@ class BatchStorage:
                         finished_at=rd.get("finished_at"),
                         file_hash=rd.get("file_hash"),
                         file_size=rd.get("file_size"),
+                        version=rd.get("version"),
                     )
                 )
             return batch

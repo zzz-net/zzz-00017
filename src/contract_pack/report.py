@@ -35,6 +35,7 @@ def batch_to_dict(batch: Batch) -> dict:
                 "finished_at": fa.finished_at,
                 "file_hash": fa.file_hash,
                 "file_size": fa.file_size,
+                "version": getattr(fa, "version", None),
             }
             for fa in batch.file_actions
         ],
@@ -69,6 +70,7 @@ def export_csv(batches: List[Batch], out_path: Path) -> None:
         "file_error",
         "file_hash",
         "file_size",
+        "file_version",
     ]
     with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -96,6 +98,7 @@ def export_csv(batches: List[Batch], out_path: Path) -> None:
                     "file_error": "",
                     "file_hash": "",
                     "file_size": "",
+                    "file_version": "",
                 }})
             for fa in b.file_actions:
                 writer.writerow({**base_row, **{
@@ -108,4 +111,5 @@ def export_csv(batches: List[Batch], out_path: Path) -> None:
                     "file_error": fa.error,
                     "file_hash": fa.file_hash or "",
                     "file_size": fa.file_size if fa.file_size is not None else "",
+                    "file_version": getattr(fa, "version", None) or "",
                 }})
