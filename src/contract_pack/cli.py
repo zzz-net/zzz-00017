@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import click
 from rich.console import Console
 from rich.table import Table
 
 from . import __version__
+from .audit import (
+    AUDIT_COMMAND_TYPES,
+    AUDIT_RESULT_STATUS,
+    AuditStorage,
+    AuditError,
+    AuditDuplicateError,
+    AuditExportError,
+    AuditConfigError,
+    export_audit_csv,
+    export_audit_json,
+)
 from .config import AppConfig, PackageConfig
 from .diff_core import (
     DIFF_CHANGE_LABELS,
@@ -40,9 +54,66 @@ from .template import (
 console = Console()
 
 
+def _get_audit_storage(cfg: AppConfig) -> Optional[AuditStorage]:
+    """根据配置获取审计存储实例，审计关闭时返回 None"""
+    if not cfg.audit.enabled:
+        return None
+    try:
+        return AuditStorage(cfg.db_path)
+    except AuditError as e:
+        console.print(f"[yellow]警告: 审计功能不可用 ({e})，操作将继续但不会记录审计[/yellow]")
+        return None
+
+
+def _try_audit_record(
+    audit: Optional[AuditStorage],
+    command_type: str,
+    operator: str,
+    result_status: str,
+    params_summary: Optional[Dict[str, Any]] = None,
+    config_summary: Optional[Dict[str, Any]] = None,
+    batch_id: Optional[str] = None,
+    package_names: Optional[List[str]] = None,
+    file_count: int = 0,
+    error_count: int = 0,
+    warning_count: int = 0,
+    error_summary: str = "",
+    detail_ref: Optional[Dict[str, Any]] = None,
+) -> None:
+    """尝试写入审计记录，失败时仅打印警告，不影响主流程"""
+    if audit is None:
+        return
+    try:
+        audit.record_operation(
+            command_type=command_type,
+            operator=operator,
+            result_status=result_status,
+            params_summary=params_summary,
+            config_summary=config_summary,
+            batch_id=batch_id,
+            package_names=package_names,
+            file_count=file_count,
+            error_count=error_count,
+            warning_count=warning_count,
+            error_summary=error_summary,
+            detail_ref=detail_ref,
+        )
+    except AuditDuplicateError:
+        pass
+    except AuditError as e:
+        console.print(f"[yellow]警告: 审计记录写入失败 ({e})[/yellow]")
+
+
+def _package_names_from_cfg(cfg: AppConfig) -> List[str]:
+    return [p.name for p in cfg.packages]
+
+
 def _load_config(ctx: click.Context, config_path: str) -> AppConfig:
     try:
         return AppConfig.load(config_path)
+    except AuditConfigError as e:
+        console.print(f"[red]审计配置错误:[/red] {e}")
+        ctx.exit(1)
     except Exception as e:
         console.print(f"[red]加载配置失败:[/red] {e}")
         ctx.exit(1)
@@ -88,9 +159,27 @@ def main(ctx: click.Context, config_path: str | None):
 def dry_run(ctx: click.Context, config_path: str | None):
     """预检: 检查缺失、重复、版本倒退、清单外文件和包名冲突 (不改文件)"""
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    pkg_names = _package_names_from_cfg(cfg)
+    error_summary = ""
+    error_count = 0
+    warning_count = 0
+    file_count = 0
+    result_status = AUDIT_RESULT_STATUS["SUCCESS"]
+
     try:
         entries = load_manifest(cfg.manifest_path)
     except Exception as e:
+        error_summary = f"加载清单失败: {e}"
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["DRY_RUN"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary={"manifest": str(cfg.manifest_path)},
+            config_summary=cfg.summary(),
+            package_names=pkg_names,
+            error_count=1,
+            error_summary=error_summary,
+        )
         console.print(f"[red]加载清单失败:[/red] {e}")
         ctx.exit(1)
 
@@ -99,9 +188,29 @@ def dry_run(ctx: click.Context, config_path: str | None):
     last_id = last_batches[0].id if last_batches else None
 
     result = run_precheck(cfg, entries, storage=storage, last_batch_id=last_id)
+    error_count = len(result.errors)
+    warning_count = len(result.warnings)
+    file_count = sum(len(v) for v in result.plan.values())
+
+    if not result.ok:
+        result_status = AUDIT_RESULT_STATUS["FAILED"]
+        error_msgs = [f"[{e.kind}] {e.package}: {e.message}" for e in result.errors]
+        error_summary = "；".join(error_msgs[:5])
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["DRY_RUN"], cfg.operator,
+        result_status,
+        params_summary={"manifest": str(cfg.manifest_path), "last_batch_id": last_id},
+        config_summary=cfg.summary(),
+        package_names=pkg_names,
+        file_count=file_count,
+        error_count=error_count,
+        warning_count=warning_count,
+        error_summary=error_summary,
+    )
 
     console.print(f"[bold]预检结果[/bold]: {'[green]通过[/green]' if result.ok else '[red]失败[/red]'}")
-    console.print(f"  条目数: {len(entries)}  计划文件: {sum(len(v) for v in result.plan.values())}")
+    console.print(f"  条目数: {len(entries)}  计划文件: {file_count}")
 
     if result.errors:
         table = Table(title="错误", show_lines=False)
@@ -111,7 +220,7 @@ def dry_run(ctx: click.Context, config_path: str | None):
         table.add_column("消息")
         table.add_column("详情")
         for i in result.errors:
-            table.add_row(i.level, i.kind, i.package, i.message, i.detail)
+            table.add_row(i.level, i.kind, i.package, i.message, i.detail or "")
         console.print(table)
 
     if result.warnings:
@@ -122,7 +231,7 @@ def dry_run(ctx: click.Context, config_path: str | None):
         table.add_column("消息")
         table.add_column("详情")
         for i in result.warnings:
-            table.add_row(i.level, i.kind, i.package, i.message, i.detail)
+            table.add_row(i.level, i.kind, i.package, i.message, i.detail or "")
         console.print(table)
 
     if not result.ok:
@@ -137,23 +246,86 @@ def dry_run(ctx: click.Context, config_path: str | None):
 def run(ctx: click.Context, config_path: str | None, zip: bool, force: bool):
     """生成批次并执行复制/压包"""
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    pkg_names = _package_names_from_cfg(cfg)
+    params = {"zip": zip, "force": force}
+    error_summary = ""
+    error_count = 0
+    warning_count = 0
+    file_count = 0
+    result_status = AUDIT_RESULT_STATUS["SUCCESS"]
+    batch_id_out: Optional[str] = None
+
     try:
         entries = load_manifest(cfg.manifest_path)
     except Exception as e:
+        error_summary = f"加载清单失败: {e}"
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["RUN"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary={**params, "manifest": str(cfg.manifest_path)},
+            config_summary=cfg.summary(),
+            package_names=pkg_names,
+            error_count=1,
+            error_summary=error_summary,
+        )
         console.print(f"[red]加载清单失败:[/red] {e}")
         ctx.exit(1)
 
     storage = BatchStorage(cfg.db_path)
     last_batches = storage.list_batches(limit=1)
     last_id = last_batches[0].id if last_batches else None
-    result = run_precheck(cfg, entries, storage=storage, last_batch_id=last_id)
+    precheck = run_precheck(cfg, entries, storage=storage, last_batch_id=last_id)
+    error_count = len(precheck.errors)
+    warning_count = len(precheck.warnings)
 
-    if not result.ok and not force:
-        console.print(f"[red]预检失败，共 {len(result.errors)} 个错误。请先运行 dry-run 查看详情，或使用 --force 强制执行。[/red]")
+    if not precheck.ok and not force:
+        result_status = AUDIT_RESULT_STATUS["FAILED"]
+        error_msgs = [f"[{e.kind}] {e.package}: {e.message}" for e in precheck.errors]
+        error_summary = "；".join(error_msgs[:5])
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["RUN"], cfg.operator,
+            result_status,
+            params_summary={**params, "manifest": str(cfg.manifest_path), "last_batch_id": last_id},
+            config_summary=cfg.summary(),
+            package_names=pkg_names,
+            file_count=sum(len(v) for v in precheck.plan.values()),
+            error_count=error_count,
+            warning_count=warning_count,
+            error_summary=error_summary,
+        )
+        console.print(f"[red]预检失败，共 {len(precheck.errors)} 个错误。请先运行 dry-run 查看详情，或使用 --force 强制执行。[/red]")
         ctx.exit(2)
 
     engine = Engine(cfg)
-    exec_result = engine.run(entries, result, make_zip=zip)
+    exec_result = engine.run(entries, precheck, make_zip=zip)
+    batch_id_out = exec_result.batch_id
+    file_count = exec_result.copied_files + exec_result.zipped_files
+
+    if exec_result.status == BATCH_STATUS["COMPLETED"]:
+        result_status = AUDIT_RESULT_STATUS["SUCCESS"]
+    elif exec_result.status == BATCH_STATUS["PARTIAL"]:
+        result_status = AUDIT_RESULT_STATUS["PARTIAL"]
+        error_summary = f"部分失败: {exec_result.failed_files} 个文件失败"
+        error_count = exec_result.failed_files
+    else:
+        result_status = AUDIT_RESULT_STATUS["FAILED"]
+        error_summary = exec_result.error or "执行失败"
+        error_count = max(error_count, exec_result.failed_files, 1)
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["RUN"], cfg.operator,
+        result_status,
+        params_summary={**params, "manifest": str(cfg.manifest_path), "last_batch_id": last_id},
+        config_summary=cfg.summary(),
+        batch_id=batch_id_out,
+        package_names=pkg_names,
+        file_count=file_count,
+        error_count=error_count,
+        warning_count=warning_count,
+        error_summary=error_summary,
+        detail_ref={"copied": exec_result.copied_files, "zipped": exec_result.zipped_files, "failed": exec_result.failed_files},
+    )
 
     status_color = {
         BATCH_STATUS["COMPLETED"]: "green",
@@ -280,8 +452,24 @@ def show(ctx: click.Context, config_path: str | None, batch_id: str):
 def rollback(ctx: click.Context, config_path: str | None, batch_id: str):
     """回滚指定批次"""
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    pkg_names = _package_names_from_cfg(cfg)
+
     engine = Engine(cfg)
     ok, msg = engine.rollback(batch_id)
+
+    result_status = AUDIT_RESULT_STATUS["SUCCESS"] if ok else AUDIT_RESULT_STATUS["FAILED"]
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["ROLLBACK"], cfg.operator,
+        result_status,
+        params_summary={"batch_id": batch_id},
+        config_summary=cfg.summary(),
+        batch_id=batch_id,
+        package_names=pkg_names,
+        error_count=0 if ok else 1,
+        error_summary="" if ok else msg,
+    )
+
     if ok:
         console.print(f"[green]{msg}[/green]")
     else:
@@ -313,6 +501,23 @@ def rerun(
     默认禁止覆盖已有交付文件和 zip。重跑前会执行 dry-run 级别预检。
     """
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    pkg_names = _package_names_from_cfg(cfg)
+    params = {
+        "parent_batch_id": batch_id,
+        "manifest_path": manifest_path,
+        "source_root": source_root,
+        "output_root": output_root,
+        "zip": zip,
+        "force": force,
+    }
+    error_summary = ""
+    error_count = 0
+    warning_count = 0
+    result_status = AUDIT_RESULT_STATUS["SUCCESS"]
+    new_batch_id: Optional[str] = None
+    file_count = 0
+
     storage = BatchStorage(cfg.db_path)
     base_dir = Path.cwd()
 
@@ -328,8 +533,49 @@ def rerun(
             force=force,
         )
     except RerunError as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["RERUN"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            batch_id=batch_id,
+            package_names=pkg_names,
+            error_count=1,
+            error_summary=str(e),
+        )
         console.print(f"[red]重跑失败: {e}[/red]")
         ctx.exit(8)
+
+    new_batch_id = result.batch_id
+    file_count = result.copied_files + result.zipped_files
+    if result.precheck:
+        error_count = len(result.precheck.errors)
+        warning_count = len(result.precheck.warnings)
+
+    if result.status == BATCH_STATUS["COMPLETED"]:
+        result_status = AUDIT_RESULT_STATUS["SUCCESS"]
+    elif result.status == BATCH_STATUS["PARTIAL"]:
+        result_status = AUDIT_RESULT_STATUS["PARTIAL"]
+        error_summary = f"部分失败: {result.failed_files} 个文件失败"
+        error_count = max(error_count, result.failed_files)
+    else:
+        result_status = AUDIT_RESULT_STATUS["FAILED"]
+        error_summary = result.error or "重跑执行失败"
+        error_count = max(error_count, result.failed_files, 1)
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["RERUN"], cfg.operator,
+        result_status,
+        params_summary=params,
+        config_summary=cfg.summary(),
+        batch_id=new_batch_id,
+        package_names=pkg_names,
+        file_count=file_count,
+        error_count=error_count,
+        warning_count=warning_count,
+        error_summary=error_summary,
+        detail_ref={"parent_batch_id": batch_id, "copied": result.copied_files, "zipped": result.zipped_files, "failed": result.failed_files},
+    )
 
     status_color = {
         BATCH_STATUS["COMPLETED"]: "green",
@@ -367,11 +613,22 @@ def rerun(
 def export(ctx: click.Context, config_path: str | None, fmt: str, output_path: str, batch_id: str | None, limit: int):
     """导出批次报告为 JSON 或 CSV"""
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    params = {"format": fmt, "output": output_path, "batch_id": batch_id, "limit": limit}
     storage = BatchStorage(cfg.db_path)
+    batch_count = 0
 
     if batch_id:
         b = storage.get_batch(batch_id)
         if not b:
+            _try_audit_record(
+                audit, AUDIT_COMMAND_TYPES["EXPORT"], cfg.operator,
+                AUDIT_RESULT_STATUS["FAILED"],
+                params_summary=params,
+                config_summary=cfg.summary(),
+                error_count=1,
+                error_summary=f"批次不存在: {batch_id}",
+            )
             console.print(f"[red]批次不存在: {batch_id}[/red]")
             ctx.exit(1)
         batches = [b]
@@ -379,10 +636,33 @@ def export(ctx: click.Context, config_path: str | None, fmt: str, output_path: s
         batches = storage.list_batches(limit=limit)
 
     out = Path(output_path)
-    if fmt == "json":
-        export_json(batches, out)
-    else:
-        export_csv(batches, out)
+    try:
+        if fmt == "json":
+            export_json(batches, out)
+        else:
+            export_csv(batches, out)
+        batch_count = len(batches)
+    except Exception as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["EXPORT"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary=str(e),
+            detail_ref={"batch_count": len(batches)},
+        )
+        console.print(f"[red]导出失败: {e}[/red]")
+        ctx.exit(1)
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["EXPORT"], cfg.operator,
+        AUDIT_RESULT_STATUS["SUCCESS"],
+        params_summary=params,
+        config_summary=cfg.summary(),
+        file_count=batch_count,
+        detail_ref={"batch_count": batch_count},
+    )
     console.print(f"[green]已导出 {len(batches)} 个批次到 {out}[/green]")
 
 
@@ -418,18 +698,57 @@ def diff(
         ctx.exit(1)
 
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    baseline_type = "batch" if batch_id else "dir"
+    baseline_ref = str(batch_id) if batch_id else str(dir_path)
+    params = {
+        "baseline_type": baseline_type,
+        "baseline_ref": baseline_ref,
+        "show_unchanged": show_unchanged,
+        "format": fmt,
+        "output": output_path,
+    }
+    total_diff_items = 0
+    error_count = 0
+    warning_count = 0
+    error_summary = ""
+
     try:
         entries = load_manifest(cfg.manifest_path)
     except Exception as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["DIFF"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary=f"加载清单失败: {e}",
+        )
         console.print(f"[red]加载清单失败:[/red] {e}")
         ctx.exit(1)
 
     storage = BatchStorage(cfg.db_path)
 
-    if batch_id:
-        result = diff_against_batch(cfg, entries, storage, batch_id)
-    else:
-        result = diff_against_directory(cfg, entries, dir_path)
+    try:
+        if batch_id:
+            result = diff_against_batch(cfg, entries, storage, batch_id)
+        else:
+            result = diff_against_directory(cfg, entries, dir_path)
+    except DiffError as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["DIFF"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary=str(e),
+        )
+        console.print(f"[red]对比失败: {e}[/red]")
+        ctx.exit(1)
+
+    total_diff_items = len(result.items)
+    error_count = sum(1 for e in result.errors if e.level == "error")
+    warning_count = sum(1 for e in result.errors if e.level == "warning")
 
     _print_diff_result(result, show_unchanged=show_unchanged)
 
@@ -437,7 +756,10 @@ def diff(
         has_errors = any(e.level == "error" for e in result.errors)
         if has_errors:
             console.print(f"[yellow]对比过程中有 {sum(1 for e in result.errors if e.level == 'error')} 个错误，以上结果可能不准确。[/yellow]")
+            error_msgs = [f"[{e.kind}] {e.message}" for e in result.errors if e.level == "error"]
+            error_summary = "；".join(error_msgs[:5])
 
+    export_success = True
     if fmt and output_path:
         out = Path(output_path)
         try:
@@ -447,13 +769,42 @@ def diff(
                 export_diff_csv(result, out)
             console.print(f"[green]差异报告已导出到 {out}[/green]")
         except PermissionError as e:
+            export_success = False
+            error_summary = f"导出失败: 权限不足 - {e}"
+            error_count += 1
             console.print(f"[red]导出失败: 权限不足 - {e}[/red]")
-            ctx.exit(1)
         except OSError as e:
+            export_success = False
+            error_summary = f"导出失败: {e}"
+            error_count += 1
             console.print(f"[red]导出失败: {e}[/red]")
-            ctx.exit(1)
 
-    if any(e.level == "error" for e in result.errors):
+    has_diff_errors = any(e.level == "error" for e in result.errors)
+    if has_diff_errors or not export_success:
+        result_status = AUDIT_RESULT_STATUS["FAILED"]
+    else:
+        result_status = AUDIT_RESULT_STATUS["SUCCESS"]
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["DIFF"], cfg.operator,
+        result_status,
+        params_summary=params,
+        config_summary=cfg.summary(),
+        batch_id=batch_id,
+        file_count=total_diff_items,
+        error_count=error_count,
+        warning_count=warning_count,
+        error_summary=error_summary,
+        detail_ref={
+            "baseline_type": baseline_type,
+            "baseline_ref": baseline_ref,
+            "total_diff_items": total_diff_items,
+        },
+    )
+
+    if not export_success:
+        ctx.exit(1)
+    if has_diff_errors:
         ctx.exit(10)
 
 
@@ -583,6 +934,9 @@ def template_group(ctx: click.Context):
 def template_save(ctx: click.Context, config_path: str | None, name: str):
     """将当前 YAML 配置的 packages / file_mapping / zip 规则保存为命名模板"""
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    package_count = len(cfg.packages)
+    params = {"template_name": name, "package_count": package_count}
     base_dir = Path(cfg.db_path).parent
 
     rel_packages = []
@@ -615,12 +969,38 @@ def template_save(ctx: click.Context, config_path: str | None, name: str):
             source_config_summary=cfg.summary(),
         )
     except TemplateNameExistsError as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_SAVE"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            file_count=package_count,
+            error_count=1,
+            error_summary=str(e),
+        )
         console.print(f"[red]保存失败: {e}[/red]")
         console.print("[yellow]提示: 使用 'contract-pack template list' 查看已有模板，或使用其他名称。[/yellow]")
         ctx.exit(5)
     except ValueError as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_SAVE"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            file_count=package_count,
+            error_count=1,
+            error_summary=str(e),
+        )
         console.print(f"[red]保存失败: {e}[/red]")
         ctx.exit(5)
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["TEMPLATE_SAVE"], cfg.operator,
+        AUDIT_RESULT_STATUS["SUCCESS"],
+        params_summary=params,
+        config_summary=cfg.summary(),
+        file_count=len(tpl.packages),
+    )
     console.print(f"[green]模板已保存:[/green] {tpl.name} (创建于 {tpl.created_at})")
     console.print(f"  包含 {len(tpl.packages)} 个包: {', '.join(p.name for p in tpl.packages)}")
 
@@ -631,8 +1011,18 @@ def template_save(ctx: click.Context, config_path: str | None, name: str):
 def template_list_cmd(ctx: click.Context, config_path: str | None):
     """列出所有已保存的交付方案模板"""
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
     storage = TemplateStorage(cfg.db_path)
     templates = storage.list_templates()
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["TEMPLATE_LIST"], cfg.operator,
+        AUDIT_RESULT_STATUS["SUCCESS"],
+        params_summary={"template_count": len(templates)},
+        config_summary=cfg.summary(),
+        file_count=len(templates),
+    )
+
     if not templates:
         console.print("[yellow]暂无保存的模板[/yellow]")
         console.print("[yellow]提示: 使用 'contract-pack template save <名称>' 保存当前配置为模板。[/yellow]")
@@ -659,12 +1049,31 @@ def template_list_cmd(ctx: click.Context, config_path: str | None):
 def template_show(ctx: click.Context, config_path: str | None, name: str):
     """查看指定模板的详细信息"""
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    params = {"template_name": name}
     storage = TemplateStorage(cfg.db_path)
     tpl = storage.get_template(name)
     if not tpl:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_SHOW"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary=f"模板不存在: {name}",
+        )
         console.print(f"[red]模板不存在: {name}[/red]")
         console.print("[yellow]提示: 使用 'contract-pack template list' 查看已有模板。[/yellow]")
         ctx.exit(1)
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["TEMPLATE_SHOW"], cfg.operator,
+        AUDIT_RESULT_STATUS["SUCCESS"],
+        params_summary={**params, "package_count": len(tpl.packages)},
+        config_summary=cfg.summary(),
+        file_count=len(tpl.packages),
+    )
+
     console.print(f"[bold]模板名[/bold]: {tpl.name}")
     console.print(f"[bold]ID[/bold]: {tpl.id}")
     console.print(f"[bold]创建时间[/bold]: {tpl.created_at}")
@@ -698,21 +1107,53 @@ def template_show(ctx: click.Context, config_path: str | None, name: str):
 def template_delete(ctx: click.Context, config_path: str | None, name: str, force: bool):
     """删除指定模板"""
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    params = {"template_name": name, "force": force}
     storage = TemplateStorage(cfg.db_path)
     tpl = storage.get_template(name)
     if not tpl:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_DELETE"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary={**params, "success": False},
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary=f"模板不存在: {name}",
+        )
         console.print(f"[red]模板不存在: {name}[/red]")
         ctx.exit(1)
     if not force:
         console.print(f"[yellow]即将删除模板: {name} (包含 {len(tpl.packages)} 个包)[/yellow]")
         confirmed = click.confirm("确认删除？", default=False)
         if not confirmed:
+            _try_audit_record(
+                audit, AUDIT_COMMAND_TYPES["TEMPLATE_DELETE"], cfg.operator,
+                AUDIT_RESULT_STATUS["SKIPPED"],
+                params_summary={**params, "success": False},
+                config_summary=cfg.summary(),
+                error_summary="用户取消删除",
+            )
             console.print("已取消")
             return
     deleted = storage.delete_template(name)
     if deleted:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_DELETE"], cfg.operator,
+            AUDIT_RESULT_STATUS["SUCCESS"],
+            params_summary={**params, "success": True, "package_count": len(tpl.packages)},
+            config_summary=cfg.summary(),
+            file_count=len(tpl.packages),
+        )
         console.print(f"[green]模板已删除: {name}[/green]")
     else:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_DELETE"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary={**params, "success": False},
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary=f"删除失败: {name}",
+        )
         console.print(f"[red]删除失败: {name}[/red]")
         ctx.exit(1)
 
@@ -726,27 +1167,64 @@ def template_delete(ctx: click.Context, config_path: str | None, name: str, forc
 def template_export(ctx: click.Context, config_path: str | None, fmt: str, output_path: str, name: str | None):
     """导出模板为 JSON 或 CSV，包含模板名、来源配置摘要和创建时间"""
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    params = {"format": fmt, "output": output_path, "template_name": name}
     storage = TemplateStorage(cfg.db_path)
     if name:
         tpl = storage.get_template(name)
         if not tpl:
+            _try_audit_record(
+                audit, AUDIT_COMMAND_TYPES["TEMPLATE_EXPORT"], cfg.operator,
+                AUDIT_RESULT_STATUS["FAILED"],
+                params_summary=params,
+                config_summary=cfg.summary(),
+                error_count=1,
+                error_summary=f"模板不存在: {name}",
+            )
             console.print(f"[red]模板不存在: {name}[/red]")
             ctx.exit(1)
         templates = [tpl]
     else:
         templates = storage.list_templates()
     if not templates:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_EXPORT"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary="没有可导出的模板",
+        )
         console.print("[yellow]没有可导出的模板[/yellow]")
         ctx.exit(1)
     out = Path(output_path)
+    template_count = len(templates)
+    template_names = [t.name for t in templates]
     try:
         if fmt == "json":
             export_template_json(templates, out)
         else:
             export_template_csv(templates, out)
     except (PermissionError, OSError) as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_EXPORT"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary={**params, "template_count": template_count, "template_names": template_names},
+            config_summary=cfg.summary(),
+            file_count=template_count,
+            error_count=1,
+            error_summary=str(e),
+        )
         console.print(f"[red]导出失败: {e}（可能是只读目录或权限不足）[/red]")
         ctx.exit(1)
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["TEMPLATE_EXPORT"], cfg.operator,
+        AUDIT_RESULT_STATUS["SUCCESS"],
+        params_summary={**params, "template_count": template_count, "template_names": template_names},
+        config_summary=cfg.summary(),
+        file_count=template_count,
+    )
     console.print(f"[green]已导出 {len(templates)} 个模板到 {out}[/green]")
 
 
@@ -759,6 +1237,9 @@ def template_export(ctx: click.Context, config_path: str | None, fmt: str, outpu
 def template_import(ctx: click.Context, config_path: str | None, fmt: str, input_path: str, force: bool):
     """从 JSON 或 CSV 导入模板，保留模板名、来源配置摘要、创建时间和包级 zip 规则"""
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    pkg_names = _package_names_from_cfg(cfg)
+    params = {"format": fmt, "input_path": input_path, "force": force}
     storage = TemplateStorage(cfg.db_path)
     in_file = Path(input_path)
 
@@ -768,15 +1249,36 @@ def template_import(ctx: click.Context, config_path: str | None, fmt: str, input
         else:
             imported = import_template_csv(in_file)
     except TemplateImportError as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_IMPORT"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            package_names=pkg_names,
+            error_count=1,
+            error_summary=str(e),
+        )
         console.print(f"[red]导入失败: {e}[/red]")
         ctx.exit(7)
 
     if not imported:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_IMPORT"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            package_names=pkg_names,
+            error_count=1,
+            error_summary="文件中没有可导入的模板",
+        )
         console.print("[yellow]文件中没有可导入的模板[/yellow]")
         ctx.exit(1)
 
     saved = 0
     skipped = 0
+    error_count = 0
+    error_summary = ""
+    imported_template_names = [t.name for t in imported]
     for tpl in imported:
         existing = storage.get_template(tpl.name)
         if existing and not force:
@@ -795,9 +1297,39 @@ def template_import(ctx: click.Context, config_path: str | None, fmt: str, input
             )
             saved += 1
         except (TemplateNameExistsError, ValueError) as e:
+            error_count += 1
+            error_summary = f"保存模板 '{tpl.name}' 失败: {e}"
+            _try_audit_record(
+                audit, AUDIT_COMMAND_TYPES["TEMPLATE_IMPORT"], cfg.operator,
+                AUDIT_RESULT_STATUS["FAILED"],
+                params_summary={**params, "saved": saved, "skipped": skipped, "imported_template_names": imported_template_names},
+                config_summary=cfg.summary(),
+                package_names=pkg_names,
+                file_count=len(imported),
+                warning_count=skipped,
+                error_count=error_count,
+                error_summary=error_summary,
+            )
             console.print(f"[red]保存模板 '{tpl.name}' 失败: {e}[/red]")
             ctx.exit(7)
 
+    if error_count > 0 or saved == 0 and skipped > 0:
+        result_status = AUDIT_RESULT_STATUS["PARTIAL"] if saved > 0 else AUDIT_RESULT_STATUS["FAILED"]
+    elif skipped > 0:
+        result_status = AUDIT_RESULT_STATUS["PARTIAL"]
+    else:
+        result_status = AUDIT_RESULT_STATUS["SUCCESS"]
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["TEMPLATE_IMPORT"], cfg.operator,
+        result_status,
+        params_summary={**params, "saved": saved, "skipped": skipped, "imported_template_names": imported_template_names},
+        config_summary=cfg.summary(),
+        package_names=pkg_names,
+        file_count=len(imported),
+        warning_count=skipped,
+        error_count=error_count,
+        error_summary=error_summary,
+    )
     console.print(f"[green]导入完成: 成功 {saved} 个, 跳过 {skipped} 个[/green]")
     for t in imported:
         scs = t.source_config_summary
@@ -834,9 +1366,27 @@ def template_apply(
 ):
     """套用模板 + 新 CSV 清单生成配置草稿，默认自动 dry-run 验证"""
     cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    params = {
+        "template_name": template_name,
+        "manifest": manifest_path,
+        "output": output_path,
+        "skip_dry_run": skip_dry_run,
+        "source_root": source_root,
+        "operator_override": operator,
+        "db_path_override": db_path,
+    }
     storage = TemplateStorage(cfg.db_path)
     tpl = storage.get_template(template_name)
     if not tpl:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_APPLY"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary=f"模板不存在: {template_name}",
+        )
         console.print(f"[red]模板不存在: {template_name}[/red]")
         console.print("[yellow]提示: 使用 'contract-pack template list' 查看已有模板。[/yellow]")
         ctx.exit(1)
@@ -845,6 +1395,10 @@ def template_apply(
     console.print(f"  清单: {manifest_path}")
     console.print(f"  输出: {output_path}")
 
+    error_count = 0
+    warning_count = 0
+    file_count = 0
+    error_summary = ""
     try:
         generated, precheck_result = apply_template(
             template=tpl,
@@ -855,12 +1409,43 @@ def template_apply(
             db_path=Path(db_path) if db_path else None,
             run_dry_run=not skip_dry_run,
         )
+        if precheck_result:
+            error_count = len(precheck_result.errors)
+            warning_count = len(precheck_result.warnings)
+            file_count = sum(len(v) for v in precheck_result.plan.values())
+            if not precheck_result.ok:
+                error_msgs = [f"[{e.kind}] {e.package}: {e.message}" for e in precheck_result.errors]
+                error_summary = "；".join(error_msgs[:5])
     except TemplateApplyError as e:
+        error_count = len(e.issues) if e.issues else 1
+        warning_count = sum(1 for i in e.issues if i.level == "warning") if e.issues else 0
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["TEMPLATE_APPLY"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary={**params, "package_count": len(tpl.packages)},
+            config_summary=cfg.summary(),
+            file_count=len(tpl.packages),
+            error_count=error_count,
+            warning_count=warning_count,
+            error_summary=str(e),
+        )
         console.print(f"[red]模板套用失败: {e}[/red]")
         if e.issues:
             _print_issues(e.issues)
         console.print("[yellow]提示: 数据库状态未被修改，可修复问题后重试。[/yellow]")
         ctx.exit(6)
+
+    result_status = AUDIT_RESULT_STATUS["SUCCESS"] if error_count == 0 else AUDIT_RESULT_STATUS["PARTIAL"]
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["TEMPLATE_APPLY"], cfg.operator,
+        result_status,
+        params_summary={**params, "package_count": len(tpl.packages)},
+        config_summary=cfg.summary(),
+        file_count=file_count if file_count > 0 else len(tpl.packages),
+        error_count=error_count,
+        warning_count=warning_count,
+        error_summary=error_summary,
+    )
 
     console.print(f"[green]配置草稿已生成:[/green] {generated}")
     if not skip_dry_run:
@@ -868,6 +1453,319 @@ def template_apply(
         if precheck_result.warnings:
             _print_issues(precheck_result.warnings)
     console.print("[yellow]提示: 请检查生成的配置，确认后使用 'contract-pack dry-run' 再验证，然后 'contract-pack run' 执行。[/yellow]")
+
+
+@main.group("audit")
+@click.pass_context
+def audit_group(ctx: click.Context):
+    """审计记录查询与导出"""
+    pass
+
+
+@audit_group.command("list")
+@_config_option
+@click.option("--command-type", "command_type", default=None, help="按命令类型过滤")
+@click.option("--operator", "operator", default=None, help="按操作者过滤")
+@click.option("--result-status", "result_status", default=None, help="按结果状态过滤 (success/failed/partial/skipped)")
+@click.option("--start-time", "start_time", default=None, help="起始时间 (ISO 格式, 如 2024-01-01T00:00:00)")
+@click.option("--end-time", "end_time", default=None, help="结束时间 (ISO 格式)")
+@click.option("--batch-id", "batch_id", default=None, help="按批次 ID 过滤")
+@click.option("--package", "package", default=None, help="按交付包名过滤")
+@click.option("--limit", "-n", default=50, show_default=True, help="显示最近多少条")
+@click.pass_context
+def audit_list(
+    ctx: click.Context,
+    config_path: str | None,
+    command_type: str | None,
+    operator: str | None,
+    result_status: str | None,
+    start_time: str | None,
+    end_time: str | None,
+    batch_id: str | None,
+    package: str | None,
+    limit: int,
+):
+    """列出审计记录，支持多维度过滤"""
+    cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    params = {
+        "start_time": start_time,
+        "end_time": end_time,
+        "operator": operator,
+        "command_type": command_type,
+        "batch_id": batch_id,
+        "package": package,
+        "result_status": result_status,
+        "limit": limit,
+    }
+    if audit is None:
+        console.print("[yellow]审计功能已关闭或不可用[/yellow]")
+        return
+
+    try:
+        records = audit.query_records(
+            start_time=start_time,
+            end_time=end_time,
+            operator=operator,
+            command_type=command_type,
+            batch_id=batch_id,
+            package_name=package,
+            result_status=result_status,
+            limit=limit,
+        )
+    except AuditError as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary=str(e),
+        )
+        console.print(f"[red]查询失败:[/red] {e}")
+        ctx.exit(1)
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
+        AUDIT_RESULT_STATUS["SUCCESS"],
+        params_summary={**params, "record_count": len(records)},
+        config_summary=cfg.summary(),
+        file_count=len(records),
+    )
+
+    if not records:
+        console.print("[yellow]暂无审计记录[/yellow]")
+        return
+
+    table = Table(title=f"审计记录 (最近 {len(records)} 条)")
+    table.add_column("ID", overflow="fold", max_width=20)
+    table.add_column("命令类型", min_width=14)
+    table.add_column("操作者")
+    table.add_column("开始时间")
+    table.add_column("状态")
+    table.add_column("批次", overflow="fold", max_width=16)
+    table.add_column("文件/错误/警告")
+    table.add_column("错误摘要", overflow="fold", max_width=30)
+
+    status_colors = {
+        AUDIT_RESULT_STATUS["SUCCESS"]: "green",
+        AUDIT_RESULT_STATUS["FAILED"]: "red",
+        AUDIT_RESULT_STATUS["PARTIAL"]: "yellow",
+        AUDIT_RESULT_STATUS["SKIPPED"]: "white",
+    }
+
+    for r in records:
+        sc = status_colors.get(r.result_status, "white")
+        batch_display = r.batch_id[:16] + "…" if r.batch_id and len(r.batch_id) > 16 else (r.batch_id or "-")
+        stats = f"{r.file_count}/{r.error_count}/{r.warning_count}"
+        table.add_row(
+            r.id,
+            r.command_type,
+            r.operator,
+            r.started_at,
+            f"[{sc}]{r.result_status}[/{sc}]",
+            batch_display,
+            stats,
+            r.error_summary or "",
+        )
+    console.print(table)
+
+
+@audit_group.command("show")
+@_config_option
+@click.argument("record_id")
+@click.pass_context
+def audit_show(ctx: click.Context, config_path: str | None, record_id: str):
+    """查看单条审计记录详情"""
+    cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    params = {"record_id": record_id}
+    if audit is None:
+        console.print("[yellow]审计功能已关闭或不可用[/yellow]")
+        ctx.exit(1)
+
+    try:
+        record = audit.get_record(record_id)
+    except AuditError as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary=str(e),
+        )
+        console.print(f"[red]查询失败:[/red] {e}")
+        ctx.exit(1)
+
+    if not record:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary=f"审计记录不存在: {record_id}",
+        )
+        console.print(f"[red]审计记录不存在: {record_id}[/red]")
+        ctx.exit(1)
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
+        AUDIT_RESULT_STATUS["SUCCESS"],
+        params_summary={**params, "target_command_type": record.command_type, "target_operator": record.operator},
+        config_summary=cfg.summary(),
+    )
+
+    d = record.to_dict()
+    console.print(f"[bold]审计记录 ID[/bold]: {d['id']}")
+    console.print(f"[bold]命令类型[/bold]: {d['command_type']}")
+    console.print(f"[bold]操作者[/bold]: {d['operator']}")
+    console.print(f"[bold]开始时间[/bold]: {d['started_at']}")
+    console.print(f"[bold]结束时间[/bold]: {d['finished_at'] or '-'}")
+    console.print(f"[bold]耗时(秒)[/bold]: {d['duration_seconds'] if d['duration_seconds'] is not None else '-'}")
+    status_color = {"success": "green", "failed": "red", "partial": "yellow", "skipped": "white"}.get(d['result_status'], "white")
+    console.print(f"[bold]结果状态[/bold]: [{status_color}]{d['result_status']}[/{status_color}]")
+    console.print(f"[bold]批次 ID[/bold]: {d['batch_id'] or '-'}")
+    console.print(f"[bold]交付包[/bold]: {', '.join(d['package_names']) if d['package_names'] else '-'}")
+    console.print(f"[bold]文件数[/bold]: {d['file_count']}  [bold]错误数[/bold]: {d['error_count']}  [bold]警告数[/bold]: {d['warning_count']}")
+    if d['error_summary']:
+        console.print(f"[bold]错误摘要[/bold]: [red]{d['error_summary']}[/red]")
+    if d['params_summary']:
+        console.print(f"[bold]参数摘要[/bold]: {json.dumps(d['params_summary'], ensure_ascii=False)}")
+    if d['detail_ref']:
+        console.print(f"[bold]详情引用[/bold]: {json.dumps(d['detail_ref'], ensure_ascii=False)}")
+
+
+@audit_group.command("export")
+@_config_option
+@click.option("--format", "-f", "fmt", type=click.Choice(["json", "csv"]), default="json", show_default=True, help="导出格式")
+@click.option("--output", "-o", "output_path", default=None, help="输出文件路径 (未指定时使用配置中的默认导出目录)")
+@click.option("--command-type", "command_type", default=None, help="按命令类型过滤")
+@click.option("--operator", "operator", default=None, help="按操作者过滤")
+@click.option("--result-status", "result_status", default=None, help="按结果状态过滤")
+@click.option("--start-time", "start_time", default=None, help="起始时间")
+@click.option("--end-time", "end_time", default=None, help="结束时间")
+@click.option("--batch-id", "batch_id", default=None, help="按批次 ID 过滤")
+@click.option("--package", "package", default=None, help="按交付包名过滤")
+@click.option("--limit", "-n", default=500, show_default=True, help="导出最近多少条")
+@click.pass_context
+def audit_export_cmd(
+    ctx: click.Context,
+    config_path: str | None,
+    fmt: str,
+    output_path: str | None,
+    command_type: str | None,
+    operator: str | None,
+    result_status: str | None,
+    start_time: str | None,
+    end_time: str | None,
+    batch_id: str | None,
+    package: str | None,
+    limit: int,
+):
+    """导出审计记录为 JSON 或 CSV"""
+    cfg = _get_cfg(ctx, config_path)
+    audit = _get_audit_storage(cfg)
+    params = {
+        "format": fmt,
+        "start_time": start_time,
+        "end_time": end_time,
+        "operator": operator,
+        "command_type": command_type,
+        "batch_id": batch_id,
+        "package": package,
+        "result_status": result_status,
+        "limit": limit,
+    }
+    if audit is None:
+        console.print("[yellow]审计功能已关闭或不可用[/yellow]")
+        ctx.exit(1)
+
+    if not output_path:
+        if cfg.audit.export_default_dir:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_name = f"audit_{timestamp}.{fmt}"
+            resolved_output = Path(cfg.audit.export_default_dir) / default_name
+            output_path = str(resolved_output)
+            console.print(f"[yellow]未指定输出路径，使用默认导出目录: {resolved_output}[/yellow]")
+        else:
+            _try_audit_record(
+                audit, AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
+                AUDIT_RESULT_STATUS["FAILED"],
+                params_summary=params,
+                config_summary=cfg.summary(),
+                error_count=1,
+                error_summary="未指定输出路径且未配置默认导出目录",
+            )
+            console.print("[red]错误: 未指定 --output 且配置中未设置 audit.export_default_dir[/red]")
+            ctx.exit(1)
+
+    params["output"] = output_path
+
+    try:
+        records = audit.query_records(
+            start_time=start_time,
+            end_time=end_time,
+            operator=operator,
+            command_type=command_type,
+            batch_id=batch_id,
+            package_name=package,
+            result_status=result_status,
+            limit=limit,
+        )
+    except AuditError as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary=f"查询失败: {e}",
+        )
+        console.print(f"[red]查询失败:[/red] {e}")
+        ctx.exit(1)
+
+    out = Path(output_path)
+    try:
+        if fmt == "json":
+            export_audit_json(records, out)
+        else:
+            export_audit_csv(records, out)
+    except AuditExportError as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary={**params, "record_count": len(records)},
+            config_summary=cfg.summary(),
+            file_count=len(records),
+            error_count=1,
+            error_summary=str(e),
+        )
+        console.print(f"[red]导出失败:[/red] {e}")
+        ctx.exit(1)
+    except (PermissionError, OSError) as e:
+        _try_audit_record(
+            audit, AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary={**params, "record_count": len(records)},
+            config_summary=cfg.summary(),
+            file_count=len(records),
+            error_count=1,
+            error_summary=str(e),
+        )
+        console.print(f"[red]导出失败:[/red] {e}")
+        ctx.exit(1)
+
+    _try_audit_record(
+        audit, AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
+        AUDIT_RESULT_STATUS["SUCCESS"],
+        params_summary={**params, "record_count": len(records)},
+        config_summary=cfg.summary(),
+        file_count=len(records),
+    )
+
+    console.print(f"[green]已导出 {len(records)} 条审计记录到 {out}[/green]")
 
 
 if __name__ == "__main__":

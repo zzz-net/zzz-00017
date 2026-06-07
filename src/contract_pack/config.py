@@ -9,6 +9,54 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from .audit import AuditConfigError
+
+
+@dataclass
+class AuditConfig:
+    """审计模块配置"""
+
+    enabled: bool = True
+    retention_days: int = 90
+    export_default_dir: Optional[Path] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], base_dir: Path) -> "AuditConfig":
+        enabled = data.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise AuditConfigError(f"audit.enabled 必须是布尔值，实际类型: {type(enabled).__name__}")
+
+        retention_days = data.get("retention_days", 90)
+        if not isinstance(retention_days, int) or isinstance(retention_days, bool):
+            raise AuditConfigError(f"audit.retention_days 必须是整数，实际: {retention_days!r}")
+        if retention_days < 0:
+            raise AuditConfigError(f"audit.retention_days 不能为负数，实际: {retention_days}")
+
+        export_default_dir = data.get("export_default_dir")
+        resolved_export_dir: Optional[Path] = None
+        if export_default_dir is not None:
+            if not isinstance(export_default_dir, (str, os.PathLike)):
+                raise AuditConfigError(
+                    f"audit.export_default_dir 必须是字符串路径，实际类型: {type(export_default_dir).__name__}"
+                )
+            p = Path(export_default_dir)
+            if not p.is_absolute():
+                p = (base_dir / p).resolve()
+            resolved_export_dir = p
+
+        return cls(
+            enabled=enabled,
+            retention_days=retention_days,
+            export_default_dir=resolved_export_dir,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "retention_days": self.retention_days,
+            "export_default_dir": str(self.export_default_dir) if self.export_default_dir else None,
+        }
+
 
 @dataclass
 class PackageConfig:
@@ -64,6 +112,7 @@ class AppConfig:
     operator: str
     db_path: Path
     allow_overwrite: bool = False
+    audit: AuditConfig = field(default_factory=AuditConfig)
 
     @classmethod
     def load(cls, config_path: str | os.PathLike) -> "AppConfig":
@@ -100,6 +149,20 @@ class AppConfig:
         if not db_path.is_absolute():
             db_path = (base_dir / db_path).resolve()
 
+        audit_data = data.get("audit", {})
+        if audit_data is None:
+            audit_data = {}
+        if not isinstance(audit_data, dict):
+            raise AuditConfigError(
+                f"audit 配置必须是字典，实际类型: {type(audit_data).__name__}"
+            )
+        try:
+            audit_cfg = AuditConfig.from_dict(audit_data, base_dir)
+        except AuditConfigError:
+            raise
+        except Exception as e:
+            raise AuditConfigError(f"audit 配置解析失败: {e}")
+
         return cls(
             manifest_path=manifest_path,
             source_root=source_root,
@@ -107,6 +170,7 @@ class AppConfig:
             operator=operator,
             db_path=db_path,
             allow_overwrite=data.get("allow_overwrite", False),
+            audit=audit_cfg,
         )
 
     def summary(self) -> Dict[str, Any]:
@@ -116,4 +180,5 @@ class AppConfig:
             "operator": self.operator,
             "packages": [p.to_dict() for p in self.packages],
             "allow_overwrite": self.allow_overwrite,
+            "audit": self.audit.to_dict(),
         }
