@@ -10,7 +10,7 @@ from rich.table import Table
 
 from . import __version__
 from .config import AppConfig, PackageConfig
-from .engine import Engine
+from .engine import Engine, RerunError, rerun_batch
 from .manifest import load_manifest
 from .precheck import PrecheckIssue, run_precheck
 from .report import export_csv, export_json
@@ -182,6 +182,7 @@ def list_batches(ctx: click.Context, config_path: str | None, limit: int):
     table.add_column("批次 ID", overflow="fold")
     table.add_column("状态", min_width=15, no_wrap=True)
     table.add_column("操作者")
+    table.add_column("父批次", overflow="fold")
     table.add_column("开始时间")
     table.add_column("结束时间")
     table.add_column("文件动作")
@@ -201,6 +202,7 @@ def list_batches(ctx: click.Context, config_path: str | None, limit: int):
             b.id,
             f"[{sc}]{b.status}[/{sc}]",
             b.operator,
+            b.parent_batch_id or "-",
             b.started_at,
             b.finished_at or "-",
             file_summary,
@@ -225,6 +227,10 @@ def show(ctx: click.Context, config_path: str | None, batch_id: str):
     console.print(f"[bold]批次 ID[/bold]: {batch.id}")
     console.print(f"[bold]状态[/bold]: {batch.status}")
     console.print(f"[bold]操作者[/bold]: {batch.operator}")
+    if batch.parent_batch_id:
+        console.print(f"[bold]父批次[/bold]: {batch.parent_batch_id}")
+    if batch.rerun_params:
+        console.print(f"[bold]重跑参数[/bold]: {batch.rerun_params}")
     console.print(f"[bold]开始[/bold]: {batch.started_at}")
     console.print(f"[bold]结束[/bold]: {batch.finished_at or '-'}")
     if batch.error:
@@ -273,6 +279,74 @@ def rollback(ctx: click.Context, config_path: str | None, batch_id: str):
     else:
         console.print(f"[red]{msg}[/red]")
         ctx.exit(4)
+
+
+@main.command()
+@_config_option
+@click.argument("batch_id")
+@click.option("--manifest", "-m", "manifest_path", default=None, help="替换原 manifest 的 CSV 文件路径（默认沿用原批次）")
+@click.option("--source-root", "source_root", default=None, help="替换原 source_root（默认沿用原批次）")
+@click.option("--output-root", "output_root", default=None, help="新的输出根目录，所有包的 output_dir 和 zip_output 重定向到此目录下")
+@click.option("--zip/--no-zip", default=False, help="是否生成 zip 压缩包")
+@click.option("--force", is_flag=True, help="跳过预检错误直接重跑（不推荐）")
+@click.pass_context
+def rerun(
+    ctx: click.Context,
+    config_path: str | None,
+    batch_id: str,
+    manifest_path: str | None,
+    source_root: str | None,
+    output_root: str | None,
+    zip: bool,
+    force: bool,
+):
+    """按历史批次重跑（基于 completed/partial 批次生成新计划并执行）
+
+    默认禁止覆盖已有交付文件和 zip。重跑前会执行 dry-run 级别预检。
+    """
+    cfg = _get_cfg(ctx, config_path)
+    storage = BatchStorage(cfg.db_path)
+    base_dir = Path.cwd()
+
+    try:
+        result = rerun_batch(
+            parent_batch_id=batch_id,
+            storage=storage,
+            base_dir=base_dir,
+            manifest_path=Path(manifest_path) if manifest_path else None,
+            source_root=Path(source_root) if source_root else None,
+            output_root=Path(output_root) if output_root else None,
+            make_zip=zip,
+            force=force,
+        )
+    except RerunError as e:
+        console.print(f"[red]重跑失败: {e}[/red]")
+        ctx.exit(8)
+
+    status_color = {
+        BATCH_STATUS["COMPLETED"]: "green",
+        BATCH_STATUS["PARTIAL"]: "yellow",
+        BATCH_STATUS["FAILED"]: "red",
+    }.get(result.status, "white")
+
+    console.print(
+        f"重跑批次 [bold]{result.batch_id}[/bold] (父批次 {result.parent_batch_id}) 执行完毕，"
+        f"状态: [bold {status_color}]{result.status}[/bold {status_color}]"
+    )
+    console.print(
+        f"  复制成功: {result.copied_files}  zip: {result.zipped_files}  失败: {result.failed_files}"
+    )
+    if result.error:
+        console.print(f"[red]错误: {result.error}[/red]")
+
+    if result.precheck:
+        if result.precheck.errors:
+            _print_issues(result.precheck.errors)
+        if result.precheck.warnings:
+            _print_issues(result.precheck.warnings)
+
+    if result.status == BATCH_STATUS["FAILED"]:
+        ctx.exit(3)
 
 
 @main.command()

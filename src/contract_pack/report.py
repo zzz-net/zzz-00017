@@ -19,6 +19,8 @@ def batch_to_dict(batch: Batch) -> dict:
         "finished_at": batch.finished_at,
         "error": batch.error,
         "config_summary": batch.config_summary,
+        "parent_batch_id": batch.parent_batch_id,
+        "rerun_params": batch.rerun_params,
         "file_actions": [
             {
                 "id": fa.id,
@@ -48,6 +50,7 @@ def export_json(batches: List[Batch], out_path: Path) -> None:
 
 def export_csv(batches: List[Batch], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    import json as _json
     fieldnames = [
         "batch_id",
         "batch_status",
@@ -55,6 +58,8 @@ def export_csv(batches: List[Batch], out_path: Path) -> None:
         "operator",
         "started_at",
         "finished_at",
+        "parent_batch_id",
+        "rerun_params",
         "package",
         "action",
         "category",
@@ -69,43 +74,38 @@ def export_csv(batches: List[Batch], out_path: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for b in batches:
+            rerun_params_str = _json.dumps(b.rerun_params, ensure_ascii=False) if b.rerun_params else ""
+            base_row = {
+                "batch_id": b.id,
+                "batch_status": b.status,
+                "batch_error": b.error,
+                "operator": b.operator,
+                "started_at": b.started_at,
+                "finished_at": b.finished_at or "",
+                "parent_batch_id": b.parent_batch_id or "",
+                "rerun_params": rerun_params_str,
+            }
             if not b.file_actions:
-                writer.writerow(
-                    {
-                        "batch_id": b.id,
-                        "batch_status": b.status,
-                        "batch_error": b.error,
-                        "operator": b.operator,
-                        "started_at": b.started_at,
-                        "finished_at": b.finished_at or "",
-                        "package": "",
-                        "action": "",
-                        "category": "",
-                        "source_path": "",
-                        "target_path": "",
-                        "file_status": "",
-                        "file_error": "",
-                        "file_hash": "",
-                        "file_size": "",
-                    }
-                )
+                writer.writerow({**base_row, **{
+                    "package": "",
+                    "action": "",
+                    "category": "",
+                    "source_path": "",
+                    "target_path": "",
+                    "file_status": "",
+                    "file_error": "",
+                    "file_hash": "",
+                    "file_size": "",
+                }})
             for fa in b.file_actions:
-                writer.writerow(
-                    {
-                        "batch_id": b.id,
-                        "batch_status": b.status,
-                        "batch_error": b.error,
-                        "operator": b.operator,
-                        "started_at": b.started_at,
-                        "finished_at": b.finished_at or "",
-                        "package": fa.package,
-                        "action": fa.action,
-                        "category": fa.category,
-                        "source_path": fa.source_path,
-                        "target_path": fa.target_path,
-                        "file_status": fa.status,
-                        "file_error": fa.error,
-                        "file_hash": fa.file_hash or "",
-                        "file_size": fa.file_size if fa.file_size is not None else "",
-                    }
-                )
+                writer.writerow({**base_row, **{
+                    "package": fa.package,
+                    "action": fa.action,
+                    "category": fa.category,
+                    "source_path": fa.source_path,
+                    "target_path": fa.target_path,
+                    "file_status": fa.status,
+                    "file_error": fa.error,
+                    "file_hash": fa.file_hash or "",
+                    "file_size": fa.file_size if fa.file_size is not None else "",
+                }})

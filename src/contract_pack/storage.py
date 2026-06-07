@@ -65,6 +65,8 @@ class Batch:
     error: str = ""
     config_summary: Dict[str, Any] = field(default_factory=dict)
     file_actions: List[FileAction] = field(default_factory=list)
+    parent_batch_id: Optional[str] = None
+    rerun_params: Dict[str, Any] = field(default_factory=dict)
 
 
 def _now_iso() -> str:
@@ -100,7 +102,9 @@ class BatchStorage:
                     started_at TEXT NOT NULL,
                     finished_at TEXT,
                     error TEXT DEFAULT '',
-                    config_summary TEXT DEFAULT '{}'
+                    config_summary TEXT DEFAULT '{}',
+                    parent_batch_id TEXT,
+                    rerun_params TEXT DEFAULT '{}'
                 );
 
                 CREATE TABLE IF NOT EXISTS file_actions (
@@ -122,29 +126,57 @@ class BatchStorage:
                     ON file_actions(batch_id);
                 CREATE INDEX IF NOT EXISTS idx_batches_started
                     ON batches(started_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_batches_parent
+                    ON batches(parent_batch_id);
                 """
             )
             self._migrate_schema(c)
 
     def _migrate_schema(self, c: sqlite3.Connection):
+        batch_cols = {r[1] for r in c.execute("PRAGMA table_info(batches)").fetchall()}
+        if "parent_batch_id" not in batch_cols:
+            c.execute("ALTER TABLE batches ADD COLUMN parent_batch_id TEXT")
+        if "rerun_params" not in batch_cols:
+            c.execute("ALTER TABLE batches ADD COLUMN rerun_params TEXT DEFAULT '{}'")
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_batches_parent ON batches(parent_batch_id)")
+        except sqlite3.OperationalError:
+            pass
+
         cols = {r[1] for r in c.execute("PRAGMA table_info(file_actions)").fetchall()}
         if "file_hash" not in cols:
             c.execute("ALTER TABLE file_actions ADD COLUMN file_hash TEXT")
         if "file_size" not in cols:
             c.execute("ALTER TABLE file_actions ADD COLUMN file_size INTEGER")
 
-    def create_batch(self, operator: str, config_summary: Dict[str, Any]) -> Batch:
+    def create_batch(
+        self,
+        operator: str,
+        config_summary: Dict[str, Any],
+        parent_batch_id: Optional[str] = None,
+        rerun_params: Optional[Dict[str, Any]] = None,
+    ) -> Batch:
         batch = Batch(
             id=str(uuid.uuid4()),
             status=BATCH_STATUS["PENDING"],
             operator=operator,
             started_at=_now_iso(),
             config_summary=config_summary,
+            parent_batch_id=parent_batch_id,
+            rerun_params=rerun_params or {},
         )
         with self._conn() as c:
             c.execute(
-                "INSERT INTO batches (id, status, operator, started_at, config_summary) VALUES (?, ?, ?, ?, ?)",
-                (batch.id, batch.status, batch.operator, batch.started_at, json.dumps(config_summary, ensure_ascii=False)),
+                "INSERT INTO batches (id, status, operator, started_at, config_summary, parent_batch_id, rerun_params) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch.id,
+                    batch.status,
+                    batch.operator,
+                    batch.started_at,
+                    json.dumps(config_summary, ensure_ascii=False),
+                    batch.parent_batch_id,
+                    json.dumps(batch.rerun_params, ensure_ascii=False),
+                ),
             )
         return batch
 
@@ -209,6 +241,8 @@ class BatchStorage:
                 finished_at=row["finished_at"],
                 error=row["error"],
                 config_summary=json.loads(row["config_summary"] or "{}"),
+                parent_batch_id=row["parent_batch_id"],
+                rerun_params=json.loads(row["rerun_params"] or "{}"),
             )
             fa_rows = c.execute(
                 "SELECT * FROM file_actions WHERE batch_id=? ORDER BY started_at",

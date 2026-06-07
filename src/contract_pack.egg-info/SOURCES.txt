@@ -15,6 +15,8 @@ src/contract_pack.egg-info/dependency_links.txt
 src/contract_pack.egg-info/entry_points.txt
 src/contract_pack.egg-info/requires.txt
 src/contract_pack.egg-info/top_level.txt
+tests/test_rerun_e2e.py
+tests/test_rerun_unit.py
 tests/test_rollback.py
 tests/test_template_e2e.py
 tests/test_template_unit.py
