@@ -10,10 +10,18 @@ from rich.table import Table
 
 from . import __version__
 from .config import AppConfig, PackageConfig
+from .diff_core import (
+    DIFF_CHANGE_LABELS,
+    DiffChangeType,
+    DiffError,
+    DiffResult,
+    diff_against_batch,
+    diff_against_directory,
+)
 from .engine import Engine, RerunError, rerun_batch
 from .manifest import load_manifest
 from .precheck import PrecheckIssue, run_precheck
-from .report import export_csv, export_json
+from .report import export_csv, export_diff_csv, export_diff_json, export_json
 from .storage import BATCH_STATUS, BatchStorage
 from .template import (
     TemplateApplyError,
@@ -376,6 +384,164 @@ def export(ctx: click.Context, config_path: str | None, fmt: str, output_path: s
     else:
         export_csv(batches, out)
     console.print(f"[green]已导出 {len(batches)} 个批次到 {out}[/green]")
+
+
+@main.command()
+@_config_option
+@click.option("--batch-id", "batch_id", default=None, help="以指定历史批次为基准进行对比")
+@click.option("--dir", "dir_path", default=None, type=click.Path(path_type=Path), help="以指定目录为基准进行对比")
+@click.option("--format", "-f", "fmt", type=click.Choice(["json", "csv"]), default=None, help="导出格式（不指定则仅打印到终端）")
+@click.option("--output", "-o", "output_path", default=None, help="导出文件路径（指定 --format 时必填）")
+@click.option("--show-unchanged/--hide-unchanged", default=False, show_default=True, help="是否显示无变化的条目")
+@click.pass_context
+def diff(
+    ctx: click.Context,
+    config_path: str | None,
+    batch_id: str | None,
+    dir_path: Path | None,
+    fmt: str | None,
+    output_path: str | None,
+    show_unchanged: bool,
+):
+    """对比当前配置+CSV清单与历史批次或指定目录的交付结果差异
+
+    输出：新增、缺失、文件名变化、版本变化、包归属变化、zip状态差异
+    """
+    if not batch_id and not dir_path:
+        console.print("[red]错误: 必须指定 --batch-id 或 --dir 其中之一作为基准[/red]")
+        ctx.exit(1)
+    if batch_id and dir_path:
+        console.print("[red]错误: --batch-id 和 --dir 不能同时指定[/red]")
+        ctx.exit(1)
+    if fmt and not output_path:
+        console.print("[red]错误: 指定 --format 时必须同时指定 --output[/red]")
+        ctx.exit(1)
+
+    cfg = _get_cfg(ctx, config_path)
+    try:
+        entries = load_manifest(cfg.manifest_path)
+    except Exception as e:
+        console.print(f"[red]加载清单失败:[/red] {e}")
+        ctx.exit(1)
+
+    storage = BatchStorage(cfg.db_path)
+
+    if batch_id:
+        result = diff_against_batch(cfg, entries, storage, batch_id)
+    else:
+        result = diff_against_directory(cfg, entries, dir_path)
+
+    _print_diff_result(result, show_unchanged=show_unchanged)
+
+    if result.errors:
+        has_errors = any(e.level == "error" for e in result.errors)
+        if has_errors:
+            console.print(f"[yellow]对比过程中有 {sum(1 for e in result.errors if e.level == 'error')} 个错误，以上结果可能不准确。[/yellow]")
+
+    if fmt and output_path:
+        out = Path(output_path)
+        try:
+            if fmt == "json":
+                export_diff_json(result, out)
+            else:
+                export_diff_csv(result, out)
+            console.print(f"[green]差异报告已导出到 {out}[/green]")
+        except PermissionError as e:
+            console.print(f"[red]导出失败: 权限不足 - {e}[/red]")
+            ctx.exit(1)
+        except OSError as e:
+            console.print(f"[red]导出失败: {e}[/red]")
+            ctx.exit(1)
+
+    if any(e.level == "error" for e in result.errors):
+        ctx.exit(10)
+
+
+def _print_diff_result(result: DiffResult, show_unchanged: bool = False):
+    """打印差异对比结果到终端"""
+    baseline_desc = (
+        f"批次 {result.baseline_ref}" if result.baseline_kind == "batch" else f"目录 {result.baseline_ref}"
+    )
+    console.print(f"[bold]交付包差异对比[/bold] (基准: {baseline_desc})")
+    console.print(f"  生成时间: {result.generated_at}")
+    console.print(f"  预期交付项: {result.total_expected}  基准交付项: {result.total_baseline}")
+
+    summary_colors = {
+        DiffChangeType.ADDED: "green",
+        DiffChangeType.MISSING: "red",
+        DiffChangeType.RENAMED: "cyan",
+        DiffChangeType.VERSION_CHANGED: "yellow",
+        DiffChangeType.PACKAGE_CHANGED: "magenta",
+        DiffChangeType.ZIP_STATUS_CHANGED: "blue",
+        DiffChangeType.CONTENT_CHANGED: "yellow",
+        DiffChangeType.UNCHANGED: "white",
+    }
+
+    summary_parts = []
+    for ct in [
+        DiffChangeType.ADDED,
+        DiffChangeType.MISSING,
+        DiffChangeType.RENAMED,
+        DiffChangeType.VERSION_CHANGED,
+        DiffChangeType.PACKAGE_CHANGED,
+        DiffChangeType.ZIP_STATUS_CHANGED,
+        DiffChangeType.CONTENT_CHANGED,
+    ]:
+        count = len([i for i in result.items if i.change_type == ct])
+        if count > 0:
+            color = summary_colors.get(ct, "white")
+            summary_parts.append(f"[{color}]{DIFF_CHANGE_LABELS[ct]}: {count}[/{color}]")
+    if summary_parts:
+        console.print("  差异汇总: " + "  ".join(summary_parts))
+    else:
+        console.print("  [green]差异汇总: 无差异[/green]")
+
+    if result.errors:
+        error_table = Table(title="对比错误/警告")
+        error_table.add_column("级别", style="red")
+        error_table.add_column("类型")
+        error_table.add_column("消息")
+        error_table.add_column("详情", overflow="fold")
+        for e in result.errors:
+            style = "red" if e.level == "error" else "yellow"
+            error_table.add_row(f"[{style}]{e.level}[/{style}]", e.kind, e.message, e.detail or "")
+        console.print(error_table)
+
+    display_items = result.items
+    if not show_unchanged:
+        display_items = [i for i in result.items if i.change_type != DiffChangeType.UNCHANGED]
+
+    if not display_items:
+        if show_unchanged:
+            console.print("[green]所有交付项一致[/green]")
+        return
+
+    diff_table = Table(title=f"差异详情 ({len(display_items)} 条)")
+    diff_table.add_column("类型", min_width=10)
+    diff_table.add_column("包")
+    diff_table.add_column("分类")
+    diff_table.add_column("当前目标名", overflow="fold")
+    diff_table.add_column("基准目标名", overflow="fold")
+    diff_table.add_column("当前版本")
+    diff_table.add_column("基准版本")
+    diff_table.add_column("详情", overflow="fold", max_width=40)
+
+    for item in display_items:
+        ct = item.change_type
+        color = summary_colors.get(ct, "white")
+        label = DIFF_CHANGE_LABELS.get(ct, ct.value)
+        diff_table.add_row(
+            f"[{color}]{label}[/{color}]",
+            item.package,
+            item.category if item.category != "__zip__" else "[zip]",
+            item.target_name,
+            item.baseline_target_name or "",
+            item.version or "",
+            item.baseline_version or "",
+            item.detail or "",
+        )
+
+    console.print(diff_table)
 
 
 def _print_issues(issues: list[PrecheckIssue]):
