@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: contract-pack
+Version: 0.1.0
+Summary: 本地合同附件打包交付 CLI - 按 CSV 清单和配置整理合同文件并打包交付
+Author: Contract Pack
+Requires-Python: >=3.9
+Requires-Dist: click>=8.1.0
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: rich>=13.0.0

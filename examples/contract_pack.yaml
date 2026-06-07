@@ -1,0 +1,20 @@
+operator: "zhangsan"
+manifest: "manifest.csv"
+source_root: "./sources"
+db_path: "./.contract_pack.db"
+allow_overwrite: false
+
+packages:
+  - name: "甲方交付包"
+    output_dir: "./deliver/PartyA"
+    zip_output: "./deliver/甲方交付包.zip"
+    version: "v2024.06"
+    file_mapping:
+      "main": "01_主合同"
+      "supplement": "02_补充协议"
+      "seal": "03_盖章扫描件"
+
+  - name: "乙方交付包"
+    output_dir: "./deliver/PartyB"
+    zip_output: "./deliver/乙方交付包.zip"
+    version: "v2024.06"

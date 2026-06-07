@@ -1,0 +1,16 @@
+README.md
+pyproject.toml
+src/contract_pack/__init__.py
+src/contract_pack/cli.py
+src/contract_pack/config.py
+src/contract_pack/engine.py
+src/contract_pack/manifest.py
+src/contract_pack/precheck.py
+src/contract_pack/report.py
+src/contract_pack/storage.py
+src/contract_pack.egg-info/PKG-INFO
+src/contract_pack.egg-info/SOURCES.txt
+src/contract_pack.egg-info/dependency_links.txt
+src/contract_pack.egg-info/entry_points.txt
+src/contract_pack.egg-info/requires.txt
+src/contract_pack.egg-info/top_level.txt

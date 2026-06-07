@@ -1,0 +1,9 @@
+package,category,source_path,target_name,version,description
+甲方交付包,main,contracts/主合同_2024.pdf,主合同_v2.pdf,v2.0,正式版主合同
+甲方交付包,supplement,contracts/补充协议一.pdf,补充协议一_v1.pdf,v1.1,关于付款方式的补充
+甲方交付包,supplement,contracts/补充协议二.pdf,补充协议二_v1.pdf,v1.0,关于交付时间的补充
+甲方交付包,seal,scans/主合同盖章页.jpg,主合同_盖章扫描件.jpg,,盖章扫描件
+甲方交付包,seal,scans/补充协议盖章页.jpg,补充协议_盖章扫描件.jpg,,盖章扫描件
+乙方交付包,main,contracts/主合同_2024.pdf,主合同.pdf,v2.0,正式版主合同
+乙方交付包,supplement,contracts/补充协议一.pdf,补充协议一.pdf,v1.1,关于付款方式的补充
+乙方交付包,seal,scans/主合同盖章页.jpg,主合同盖章.jpg,,
