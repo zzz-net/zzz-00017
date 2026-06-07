@@ -15,6 +15,7 @@ from . import __version__
 from .audit import (
     AUDIT_COMMAND_TYPES,
     AUDIT_RESULT_STATUS,
+    AuditService,
     AuditStorage,
     AuditError,
     AuditDuplicateError,
@@ -54,15 +55,18 @@ from .template import (
 console = Console()
 
 
+def _get_audit_service(cfg: AppConfig) -> AuditService:
+    """根据配置获取审计服务实例（审计关闭或存储不可用时返回 disabled 服务）"""
+    svc = AuditService.from_config(cfg)
+    if cfg.audit.enabled and not svc.enabled:
+        console.print("[yellow]警告: 审计功能已启用但存储不可用，操作将继续但不会记录审计[/yellow]")
+    return svc
+
+
 def _get_audit_storage(cfg: AppConfig) -> Optional[AuditStorage]:
-    """根据配置获取审计存储实例，审计关闭时返回 None"""
-    if not cfg.audit.enabled:
-        return None
-    try:
-        return AuditStorage(cfg.db_path)
-    except AuditError as e:
-        console.print(f"[yellow]警告: 审计功能不可用 ({e})，操作将继续但不会记录审计[/yellow]")
-        return None
+    """兼容旧调用：根据配置获取审计存储实例，审计关闭时返回 None"""
+    svc = _get_audit_service(cfg)
+    return svc.storage if svc.enabled else None
 
 
 def _try_audit_record(
@@ -80,7 +84,7 @@ def _try_audit_record(
     error_summary: str = "",
     detail_ref: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """尝试写入审计记录，失败时仅打印警告，不影响主流程"""
+    """兼容旧调用：尝试写入审计记录，失败时仅打印警告，不影响主流程"""
     if audit is None:
         return
     try:
@@ -1487,7 +1491,7 @@ def audit_list(
 ):
     """列出审计记录，支持多维度过滤"""
     cfg = _get_cfg(ctx, config_path)
-    audit = _get_audit_storage(cfg)
+    svc = _get_audit_service(cfg)
     params = {
         "start_time": start_time,
         "end_time": end_time,
@@ -1498,12 +1502,13 @@ def audit_list(
         "result_status": result_status,
         "limit": limit,
     }
-    if audit is None:
+
+    if not svc.enabled:
         console.print("[yellow]审计功能已关闭或不可用[/yellow]")
         return
 
     try:
-        records = audit.query_records(
+        records = svc.query(
             start_time=start_time,
             end_time=end_time,
             operator=operator,
@@ -1514,8 +1519,8 @@ def audit_list(
             limit=limit,
         )
     except AuditError as e:
-        _try_audit_record(
-            audit, AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
+        svc.try_record(
+            AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
             AUDIT_RESULT_STATUS["FAILED"],
             params_summary=params,
             config_summary=cfg.summary(),
@@ -1525,8 +1530,8 @@ def audit_list(
         console.print(f"[red]查询失败:[/red] {e}")
         ctx.exit(1)
 
-    _try_audit_record(
-        audit, AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
+    svc.try_record(
+        AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
         AUDIT_RESULT_STATUS["SUCCESS"],
         params_summary={**params, "record_count": len(records)},
         config_summary=cfg.summary(),
@@ -1578,17 +1583,18 @@ def audit_list(
 def audit_show(ctx: click.Context, config_path: str | None, record_id: str):
     """查看单条审计记录详情"""
     cfg = _get_cfg(ctx, config_path)
-    audit = _get_audit_storage(cfg)
+    svc = _get_audit_service(cfg)
     params = {"record_id": record_id}
-    if audit is None:
+
+    if not svc.enabled:
         console.print("[yellow]审计功能已关闭或不可用[/yellow]")
         ctx.exit(1)
 
     try:
-        record = audit.get_record(record_id)
+        record = svc.get(record_id)
     except AuditError as e:
-        _try_audit_record(
-            audit, AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
+        svc.try_record(
+            AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
             AUDIT_RESULT_STATUS["FAILED"],
             params_summary=params,
             config_summary=cfg.summary(),
@@ -1599,8 +1605,8 @@ def audit_show(ctx: click.Context, config_path: str | None, record_id: str):
         ctx.exit(1)
 
     if not record:
-        _try_audit_record(
-            audit, AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
+        svc.try_record(
+            AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
             AUDIT_RESULT_STATUS["FAILED"],
             params_summary=params,
             config_summary=cfg.summary(),
@@ -1610,8 +1616,8 @@ def audit_show(ctx: click.Context, config_path: str | None, record_id: str):
         console.print(f"[red]审计记录不存在: {record_id}[/red]")
         ctx.exit(1)
 
-    _try_audit_record(
-        audit, AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
+    svc.try_record(
+        AUDIT_COMMAND_TYPES["AUDIT_QUERY"], cfg.operator,
         AUDIT_RESULT_STATUS["SUCCESS"],
         params_summary={**params, "target_command_type": record.command_type, "target_operator": record.operator},
         config_summary=cfg.summary(),
@@ -1666,7 +1672,7 @@ def audit_export_cmd(
 ):
     """导出审计记录为 JSON 或 CSV"""
     cfg = _get_cfg(ctx, config_path)
-    audit = _get_audit_storage(cfg)
+    svc = _get_audit_service(cfg)
     params = {
         "format": fmt,
         "start_time": start_time,
@@ -1678,33 +1684,31 @@ def audit_export_cmd(
         "result_status": result_status,
         "limit": limit,
     }
-    if audit is None:
+
+    if not svc.enabled:
         console.print("[yellow]审计功能已关闭或不可用[/yellow]")
         ctx.exit(1)
 
-    if not output_path:
-        if cfg.audit.export_default_dir:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            default_name = f"audit_{timestamp}.{fmt}"
-            resolved_output = Path(cfg.audit.export_default_dir) / default_name
-            output_path = str(resolved_output)
-            console.print(f"[yellow]未指定输出路径，使用默认导出目录: {resolved_output}[/yellow]")
-        else:
-            _try_audit_record(
-                audit, AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
-                AUDIT_RESULT_STATUS["FAILED"],
-                params_summary=params,
-                config_summary=cfg.summary(),
-                error_count=1,
-                error_summary="未指定输出路径且未配置默认导出目录",
-            )
-            console.print("[red]错误: 未指定 --output 且配置中未设置 audit.export_default_dir[/red]")
-            ctx.exit(1)
+    resolved = svc.resolve_export_path(output_path, fmt)
+    if resolved is None:
+        svc.try_record(
+            AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
+            AUDIT_RESULT_STATUS["FAILED"],
+            params_summary=params,
+            config_summary=cfg.summary(),
+            error_count=1,
+            error_summary="未指定输出路径且未配置默认导出目录",
+        )
+        console.print("[red]错误: 未指定 --output 且配置中未设置 audit.export_default_dir[/red]")
+        ctx.exit(1)
 
-    params["output"] = output_path
+    if not output_path:
+        console.print(f"[yellow]未指定输出路径，使用默认导出目录: {resolved}[/yellow]")
+
+    params["output"] = str(resolved)
 
     try:
-        records = audit.query_records(
+        records = svc.query(
             start_time=start_time,
             end_time=end_time,
             operator=operator,
@@ -1715,8 +1719,8 @@ def audit_export_cmd(
             limit=limit,
         )
     except AuditError as e:
-        _try_audit_record(
-            audit, AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
+        svc.try_record(
+            AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
             AUDIT_RESULT_STATUS["FAILED"],
             params_summary=params,
             config_summary=cfg.summary(),
@@ -1726,27 +1730,14 @@ def audit_export_cmd(
         console.print(f"[red]查询失败:[/red] {e}")
         ctx.exit(1)
 
-    out = Path(output_path)
     try:
         if fmt == "json":
-            export_audit_json(records, out)
+            svc.export_json(records, resolved)
         else:
-            export_audit_csv(records, out)
-    except AuditExportError as e:
-        _try_audit_record(
-            audit, AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
-            AUDIT_RESULT_STATUS["FAILED"],
-            params_summary={**params, "record_count": len(records)},
-            config_summary=cfg.summary(),
-            file_count=len(records),
-            error_count=1,
-            error_summary=str(e),
-        )
-        console.print(f"[red]导出失败:[/red] {e}")
-        ctx.exit(1)
-    except (PermissionError, OSError) as e:
-        _try_audit_record(
-            audit, AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
+            svc.export_csv(records, resolved)
+    except (AuditExportError, PermissionError, OSError) as e:
+        svc.try_record(
+            AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
             AUDIT_RESULT_STATUS["FAILED"],
             params_summary={**params, "record_count": len(records)},
             config_summary=cfg.summary(),
@@ -1757,15 +1748,15 @@ def audit_export_cmd(
         console.print(f"[red]导出失败:[/red] {e}")
         ctx.exit(1)
 
-    _try_audit_record(
-        audit, AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
+    svc.try_record(
+        AUDIT_COMMAND_TYPES["AUDIT_EXPORT"], cfg.operator,
         AUDIT_RESULT_STATUS["SUCCESS"],
         params_summary={**params, "record_count": len(records)},
         config_summary=cfg.summary(),
         file_count=len(records),
     )
 
-    console.print(f"[green]已导出 {len(records)} 条审计记录到 {out}[/green]")
+    console.print(f"[green]已导出 {len(records)} 条审计记录到 {resolved}[/green]")
 
 
 if __name__ == "__main__":

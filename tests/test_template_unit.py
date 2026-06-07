@@ -855,7 +855,7 @@ def test_import_force_overwrite_preserves_imported_created_at():
         )
         assert_eq(saved.created_at == import_ts, f"--force 覆盖后 created_at={saved.created_at} == 导入={import_ts}")
         assert_eq(saved.id == import_id, f"--force 覆盖后 id={saved.id} == 导入={import_id}")
-        assert saved.created_at != existing_ts, "覆盖后不再是旧模板的 created_at"
+        assert saved.id != existing_id, "覆盖后不再是旧模板的 id"
 
         with storage._conn() as c:
             row = c.execute("SELECT id, created_at FROM templates WHERE name=?", ("覆盖目标",)).fetchone()
@@ -874,8 +874,8 @@ def test_save_template_default_generates_new_created_at_and_id():
         before = _now_iso()
         tpl = storage.save_template("新建", _make_packages(), _make_summary())
         after = _now_iso()
-        assert_eq(bool(tpl.created_at), True, "新模板有 created_at")
-        assert_eq(bool(tpl.id), True, "新模板有 id")
+        assert_eq(bool(tpl.created_at), "新模板有 created_at")
+        assert_eq(bool(tpl.id), "新模板有 id")
         assert before <= tpl.created_at <= after, f"时间在 before={before} 和 after={after} 之间: {tpl.created_at}"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

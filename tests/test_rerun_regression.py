@@ -69,6 +69,7 @@ def _make_env(
     batch_status: str = BATCH_STATUS["COMPLETED"],
 ) -> tuple[Batch, Path, Path]:
     """创建完整工作环境：v2 父批次 + 已存在的交付文件/zip（覆盖风险场景）。"""
+    tmpdir = Path(str(tmpdir))
     work = tmpdir / "scenario"
     if work.exists():
         shutil.rmtree(work)
@@ -457,6 +458,7 @@ def test_bug_rollback_isolation_and_original_untouched(tmpdir: Path):
 def test_partial_parent_can_rerun_and_blocked(tmpdir: Path):
     """partial 父批次也能重跑，且同样受覆盖阻止 / 版本倒退阻止。"""
     print(f"\n=== {test_partial_parent_can_rerun_and_blocked.__name__} ===")
+    tmpdir = Path(str(tmpdir))
     work = tmpdir / "scenario_partial"
     work.mkdir()
 

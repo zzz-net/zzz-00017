@@ -111,11 +111,109 @@ package,category,source_path,target_name,version,description
 | empty_package | warning | 配置的包在清单中无文件 |
 | zip_exists | warning | zip 文件已存在 |
 
+## 审计时间线
+
+所有 CLI 操作（dry-run、run、rerun、rollback、diff、template 导入/导出/套用）都会自动写入可查询的审计流水，持久化到 SQLite，重启后仍可查完整记录。
+
+### 审计配置 (contract_pack.yaml)
+
+```yaml
+audit:
+  enabled: true                    # 是否开启审计（默认 true）
+  retention_days: 90               # 审计记录保留天数（默认 90，0 或负数值非法）
+  export_default_dir: "./audit"    # audit export 的默认输出目录（可选）
+```
+
+非法配置加载时会给出明确错误信息，例如：
+- `audit.enabled 必须是布尔值`
+- `audit.retention_days 不能为负数`
+- `audit.export_default_dir 必须是字符串路径`
+
+### 审计查询
+
+```bash
+# 查看最近 20 条审计记录
+contract-pack -c config.yaml audit list -n 20
+
+# 按操作者过滤
+contract-pack -c config.yaml audit list --operator zhangsan
+
+# 按命令类型过滤（dry-run/run/rerun/rollback/diff/template-import 等）
+contract-pack -c config.yaml audit list --command-type run
+
+# 按结果状态过滤（success/failed/partial/skipped）
+contract-pack -c config.yaml audit list --result-status failed
+
+# 按关联批次 ID 过滤
+contract-pack -c config.yaml audit list --batch-id <BATCH_ID>
+
+# 按包名过滤
+contract-pack -c config.yaml audit list --package 甲方交付包
+
+# 按时间范围过滤（ISO 格式）
+contract-pack -c config.yaml audit list \
+  --start-time 2024-06-01T00:00:00 \
+  --end-time   2024-06-30T23:59:59
+
+# 多条件组合过滤
+contract-pack -c config.yaml audit list \
+  --operator zhangsan \
+  --command-type run \
+  --result-status failed \
+  -n 50
+
+# 查看单条审计记录详情
+contract-pack -c config.yaml audit show <AUDIT_RECORD_ID>
+```
+
+每条审计记录包含：
+- **参数摘要** (`params_summary`)：命令行参数的精简 JSON
+- **配置摘要** (`config_summary`)：配置文件关键信息快照
+- **关联批次** (`batch_id`)：run/rerun/rollback 等操作关联的批次 ID
+- **包名列表** (`package_names`)：涉及的交付包名
+- **文件数量** (`file_count`)：成功处理的文件数
+- **错误/警告摘要** (`error_count` / `warning_count` / `error_summary`)
+- **详情引用** (`detail_ref`)：如复制数、压缩数、失败数等结构化细节
+
+### 审计导出
+
+支持 JSON 和 CSV 两种格式，字段稳定，便于后续分析归档。
+
+```bash
+# 导出 JSON（字段稳定，包含完整嵌套结构）
+contract-pack -c config.yaml audit export -f json -o audit.json
+
+# 导出 CSV（复杂字段序列化为 JSON 字符串，适合 Excel）
+contract-pack -c config.yaml audit export -f csv -o audit.csv
+
+# 导出指定过滤范围的记录
+contract-pack -c config.yaml audit export \
+  -f json -o audit_june.json \
+  --start-time 2024-06-01T00:00:00 \
+  --end-time   2024-06-30T23:59:59 \
+  --operator zhangsan
+```
+
+导出时的错误处理（绝不"假成功"）：
+- 导出路径已存在 → 明确报错 `导出文件已存在: xxx（请先删除或指定其他路径）`
+- 导出路径是目录 → 明确报错 `导出路径已存在且是目录: xxx`
+- 导出目录只读/权限不足 → 明确报错 `导出目录无写入权限: xxx`
+- 数据库缺表或损坏 → 报错 `查询审计记录失败: ...`
+- 旧记录字段缺失 → 自动降级为默认值，不会崩溃
+
+### 审计去重与完整性
+
+- **同一次操作不重复写**：同一分钟内相同 operator + 相同 command_type + 相同参数的调用会被去重拒绝（`AuditDuplicateError`），避免重复流水
+- **失败操作也留流水**：即使模板导入失败、重跑失败、dry-run 预检不通过，也会写入 `failed` 状态的审计记录，保留参数、错误摘要和详情引用
+- **关闭审计**：设置 `audit.enabled: false` 后，所有命令正常执行但不写入审计记录，`audit list/export` 查询不到数据
+
 ## 失败路径保障
 
 - `dry-run` 只读，不会修改任何文件
 - 源路径不存在的文件不会进入批次动作列表，批次不会被标记为 completed
 - 回滚时若目标路径已被其他文件/目录占用，会立即停止并提示，不会强制删除
+- 审计导出绝不"假成功"：路径冲突、权限不足、数据库损坏都会给出可读错误并非零退出
+- 失败的模板导入/重跑/预检等操作仍然写入审计流水，事后可追溯
 
 ## 命令速查
 
@@ -127,6 +225,18 @@ contract-pack -c config.yaml run --zip --force    # 跳过预检错误强制执�
 contract-pack -c config.yaml list -n 10           # 查看最近 10 个批次
 contract-pack -c config.yaml show <BATCH_ID>      # 查看批次详情
 contract-pack -c config.yaml rollback <BATCH_ID>  # 回滚批次
-contract-pack -c config.yaml export -f json -o report.json   # 导出 JSON
-contract-pack -c config.yaml export -f csv  -o report.csv    # 导出 CSV
+contract-pack -c config.yaml export -f json -o report.json   # 导出批次 JSON
+contract-pack -c config.yaml export -f csv  -o report.csv    # 导出批次 CSV
+
+# --- 审计时间线 ---
+contract-pack -c config.yaml audit list -n 20                         # 列出审计记录
+contract-pack -c config.yaml audit list --operator zhangsan           # 按操作者过滤
+contract-pack -c config.yaml audit list --command-type run            # 按命令类型过滤
+contract-pack -c config.yaml audit list --result-status failed        # 按结果状态过滤
+contract-pack -c config.yaml audit list --batch-id <BATCH_ID>         # 按批次过滤
+contract-pack -c config.yaml audit list --package 甲方交付包            # 按包名过滤
+contract-pack -c config.yaml audit list --start-time 2024-06-01T00:00:00  # 按时间范围
+contract-pack -c config.yaml audit show <AUDIT_ID>                    # 单条详情
+contract-pack -c config.yaml audit export -f json -o audit.json       # 导出审计 JSON
+contract-pack -c config.yaml audit export -f csv  -o audit.csv        # 导出审计 CSV
 ```

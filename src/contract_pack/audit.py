@@ -1,4 +1,10 @@
-"""审计时间线模块 - 记录所有 CLI 操作流水并支持查询和导出"""
+"""审计时间线模块
+
+分层结构：
+  - 数据模型与常量：AuditRecord, AUDIT_*, 异常类
+  - 存储层：AuditStorage，纯 CRUD + schema 迁移，不含业务逻辑
+  - 服务层：AuditService，统一处理写入/查询/过滤/导出/迁移/审计关闭
+"""
 
 from __future__ import annotations
 
@@ -13,6 +19,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
 
 AUDIT_COMMAND_TYPES = {
     "DRY_RUN": "dry-run",
@@ -61,6 +71,10 @@ AUDIT_EXPORT_FIELDNAMES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# 异常类
+# ---------------------------------------------------------------------------
+
 class AuditError(Exception):
     """审计模块错误基类"""
     pass
@@ -85,6 +99,10 @@ class AuditConfigError(AuditError):
     """审计配置错误"""
     pass
 
+
+# ---------------------------------------------------------------------------
+# 数据模型
+# ---------------------------------------------------------------------------
 
 @dataclass
 class AuditRecord:
@@ -134,6 +152,10 @@ class AuditRecord:
         }
 
 
+# ---------------------------------------------------------------------------
+# 内部工具
+# ---------------------------------------------------------------------------
+
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -144,7 +166,6 @@ def _generate_dedupe_key(
     params_summary: Dict[str, Any],
     started_at: str,
 ) -> str:
-    """生成用于去重的哈希键"""
     payload = {
         "command_type": command_type,
         "operator": operator,
@@ -155,8 +176,12 @@ def _generate_dedupe_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+# ===========================================================================
+# 存储层：纯 CRUD + schema 迁移，不含业务逻辑
+# ===========================================================================
+
 class AuditStorage:
-    """审计记录 SQLite 存储"""
+    """审计记录 SQLite 存储 —— 只负责持久化，不做业务校验/导出"""
 
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
@@ -181,6 +206,8 @@ class AuditStorage:
             raise
         finally:
             conn.close()
+
+    # -- schema 与迁移 ----------------------------------------------------
 
     def _init_schema(self):
         try:
@@ -235,6 +262,8 @@ class AuditStorage:
         except sqlite3.OperationalError:
             pass
 
+    # -- 写入 --------------------------------------------------------------
+
     def start_record(
         self,
         command_type: str,
@@ -244,7 +273,6 @@ class AuditStorage:
         batch_id: Optional[str] = None,
         package_names: Optional[List[str]] = None,
     ) -> AuditRecord:
-        """开始一条审计记录（创建 running 状态的记录），若同一分钟内同参数已存在则抛出重复错误"""
         if command_type not in set(AUDIT_COMMAND_TYPES.values()):
             raise AuditConfigError(f"未知的命令类型: {command_type}")
 
@@ -315,7 +343,6 @@ class AuditStorage:
         batch_id: Optional[str] = None,
         package_names: Optional[List[str]] = None,
     ) -> None:
-        """完成一条审计记录，更新状态和统计信息"""
         if result_status not in set(AUDIT_RESULT_STATUS.values()):
             raise AuditConfigError(f"未知的结果状态: {result_status}")
 
@@ -363,7 +390,11 @@ class AuditStorage:
         error_summary: str = "",
         detail_ref: Optional[Dict[str, Any]] = None,
     ) -> AuditRecord:
-        """一次性写入完整审计记录（适合快速操作），失败时也保证留痕"""
+        if command_type not in set(AUDIT_COMMAND_TYPES.values()):
+            raise AuditConfigError(f"未知的命令类型: {command_type}")
+        if result_status not in set(AUDIT_RESULT_STATUS.values()):
+            raise AuditConfigError(f"未知的结果状态: {result_status}")
+
         params_summary = params_summary or {}
         config_summary = config_summary or {}
         package_names = package_names or []
@@ -430,6 +461,17 @@ class AuditStorage:
 
         return record
 
+    # -- 读取 --------------------------------------------------------------
+
+    @staticmethod
+    def _safe_json_load(raw: Optional[str], default: Any) -> Any:
+        if not raw:
+            return default
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return default
+
     def _row_to_record(self, row: sqlite3.Row) -> AuditRecord:
         rd = dict(row)
         return AuditRecord(
@@ -450,15 +492,6 @@ class AuditStorage:
             detail_ref=self._safe_json_load(rd.get("detail_ref"), {}),
         )
 
-    @staticmethod
-    def _safe_json_load(raw: Optional[str], default: Any) -> Any:
-        if not raw:
-            return default
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return default
-
     def query_records(
         self,
         start_time: Optional[str] = None,
@@ -471,7 +504,6 @@ class AuditStorage:
         result_status: Optional[str] = None,
         limit: int = 100,
     ) -> List[AuditRecord]:
-        """按条件查询审计记录，支持多维度过滤组合"""
         conditions: List[str] = []
         params: List[Any] = []
 
@@ -518,7 +550,6 @@ class AuditStorage:
             raise AuditDatabaseError(f"查询审计记录失败: {e}")
 
     def get_record(self, record_id: str) -> Optional[AuditRecord]:
-        """获取单条审计记录"""
         try:
             with self._conn() as c:
                 row = c.execute(
@@ -529,8 +560,9 @@ class AuditStorage:
         except sqlite3.Error as e:
             raise AuditDatabaseError(f"获取审计记录失败: {e}")
 
+    # -- 清理 --------------------------------------------------------------
+
     def cleanup_old_records(self, retention_days: int) -> int:
-        """清理超过保留天数的旧记录，返回删除的条数"""
         if retention_days <= 0:
             return 0
         cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat(timespec="seconds")
@@ -545,37 +577,245 @@ class AuditStorage:
             raise AuditDatabaseError(f"清理旧审计记录失败: {e}")
 
 
-def _validate_export_path(out_path: Path) -> None:
-    """验证导出路径的可写性，路径已存在、只读目录时报可读错误"""
-    if out_path.exists():
-        if out_path.is_dir():
-            raise AuditExportError(f"导出路径已存在且是目录: {out_path}")
-        raise AuditExportError(f"导出文件已存在: {out_path}（请先删除或指定其他路径）")
+# ===========================================================================
+# 服务层：统一业务逻辑 —— 写入/查询/过滤/导出/迁移/审计关闭
+# ===========================================================================
 
-    parent = out_path.parent
-    if not parent.exists():
+class AuditService:
+    """审计服务 —— 业务入口，封装所有审计相关操作
+
+    职责：
+      - 根据配置决定是否启用审计（关闭时所有写操作为 no-op，查询返回空）
+      - 安全写入（失败不影响主流程，仅记录警告）
+      - 查询与过滤
+      - JSON/CSV 导出（含路径校验）
+      - 旧数据迁移（由 AuditStorage._init_schema 驱动，入口在此）
+    """
+
+    def __init__(self, storage: Optional[AuditStorage], enabled: bool,
+                 retention_days: int = 90,
+                 export_default_dir: Optional[Path] = None):
+        self._storage = storage
+        self._enabled = enabled and storage is not None
+        self._retention_days = retention_days
+        self._export_default_dir = export_default_dir
+
+    # -- 工厂方法 ----------------------------------------------------------
+
+    @classmethod
+    def from_config(cls, cfg) -> "AuditService":
+        """根据 AppConfig 创建 AuditService；审计关闭或存储不可用时返回 disabled 实例"""
+        from .config import AuditConfig  # 延迟导入避免循环
+        audit_cfg: AuditConfig = cfg.audit
+        if not audit_cfg.enabled:
+            return cls(
+                storage=None,
+                enabled=False,
+                retention_days=audit_cfg.retention_days,
+                export_default_dir=audit_cfg.export_default_dir,
+            )
         try:
-            parent.mkdir(parents=True, exist_ok=True)
+            storage = AuditStorage(cfg.db_path)
+            return cls(
+                storage=storage,
+                enabled=True,
+                retention_days=audit_cfg.retention_days,
+                export_default_dir=audit_cfg.export_default_dir,
+            )
+        except AuditError:
+            return cls(
+                storage=None,
+                enabled=False,
+                retention_days=audit_cfg.retention_days,
+                export_default_dir=audit_cfg.export_default_dir,
+            )
+
+    # -- 属性 --------------------------------------------------------------
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def storage(self) -> Optional[AuditStorage]:
+        """仅用于需要直接访问存储的测试；业务代码应优先使用服务方法"""
+        return self._storage
+
+    @property
+    def export_default_dir(self) -> Optional[Path]:
+        return self._export_default_dir
+
+    # -- 写入（安全：失败不抛异常） ------------------------------------------
+
+    def try_record(
+        self,
+        command_type: str,
+        operator: str,
+        result_status: str,
+        params_summary: Optional[Dict[str, Any]] = None,
+        config_summary: Optional[Dict[str, Any]] = None,
+        batch_id: Optional[str] = None,
+        package_names: Optional[List[str]] = None,
+        file_count: int = 0,
+        error_count: int = 0,
+        warning_count: int = 0,
+        error_summary: str = "",
+        detail_ref: Optional[Dict[str, Any]] = None,
+    ) -> Optional[AuditRecord]:
+        """尝试写入审计记录；审计关闭/去重/存储异常均返回 None，不影响主流程"""
+        if not self._enabled or self._storage is None:
+            return None
+        try:
+            return self._storage.record_operation(
+                command_type=command_type,
+                operator=operator,
+                result_status=result_status,
+                params_summary=params_summary,
+                config_summary=config_summary,
+                batch_id=batch_id,
+                package_names=package_names,
+                file_count=file_count,
+                error_count=error_count,
+                warning_count=warning_count,
+                error_summary=error_summary,
+                detail_ref=detail_ref,
+            )
+        except AuditDuplicateError:
+            return None
+        except AuditError:
+            return None
+
+    # -- 查询 --------------------------------------------------------------
+
+    def query(
+        self,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        operator: Optional[str] = None,
+        command_type: Optional[str] = None,
+        command_types: Optional[List[str]] = None,
+        batch_id: Optional[str] = None,
+        package_name: Optional[str] = None,
+        result_status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[AuditRecord]:
+        if not self._enabled or self._storage is None:
+            return []
+        return self._storage.query_records(
+            start_time=start_time,
+            end_time=end_time,
+            operator=operator,
+            command_type=command_type,
+            command_types=command_types,
+            batch_id=batch_id,
+            package_name=package_name,
+            result_status=result_status,
+            limit=limit,
+        )
+
+    def get(self, record_id: str) -> Optional[AuditRecord]:
+        if not self._enabled or self._storage is None:
+            return None
+        return self._storage.get_record(record_id)
+
+    # -- 导出 --------------------------------------------------------------
+
+    @staticmethod
+    def _validate_export_path(out_path: Path) -> None:
+        if out_path.exists():
+            if out_path.is_dir():
+                raise AuditExportError(f"导出路径已存在且是目录: {out_path}")
+            raise AuditExportError(f"导出文件已存在: {out_path}（请先删除或指定其他路径）")
+
+        parent = out_path.parent
+        if not parent.exists():
+            try:
+                parent.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise AuditExportError(f"无法创建导出目录 {parent}: {e}")
+
+        if not parent.is_dir():
+            raise AuditExportError(f"导出路径父级不是目录: {parent}")
+
+        test_file = parent / f"._audit_writable_test_{uuid.uuid4().hex}"
+        try:
+            test_file.write_text("", encoding="utf-8")
+            test_file.unlink()
+        except PermissionError:
+            raise AuditExportError(f"导出目录无写入权限: {parent}")
         except OSError as e:
-            raise AuditExportError(f"无法创建导出目录 {parent}: {e}")
+            raise AuditExportError(f"导出目录不可写 {parent}: {e}")
 
-    if not parent.is_dir():
-        raise AuditExportError(f"导出路径父级不是目录: {parent}")
+    def resolve_export_path(self, output_path: Optional[str], fmt: str) -> Optional[Path]:
+        """根据 CLI 输出路径和默认导出目录解析最终路径；无法解析返回 None"""
+        if output_path:
+            return Path(output_path)
+        if self._export_default_dir:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_name = f"audit_{timestamp}.{fmt}"
+            return Path(self._export_default_dir) / default_name
+        return None
 
-    test_file = parent / f"._audit_writable_test_{uuid.uuid4().hex}"
-    try:
-        test_file.write_text("", encoding="utf-8")
-        test_file.unlink()
-    except PermissionError:
-        raise AuditExportError(f"导出目录无写入权限: {parent}")
-    except OSError as e:
-        raise AuditExportError(f"导出目录不可写 {parent}: {e}")
+    def export_json(
+        self,
+        records: List[AuditRecord],
+        out_path: Path,
+    ) -> None:
+        out_path = Path(out_path)
+        self._validate_export_path(out_path)
+        data = [r.to_dict() for r in records]
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except PermissionError:
+            raise AuditExportError(f"导出失败: 权限不足，无法写入 {out_path}")
+        except OSError as e:
+            raise AuditExportError(f"导出 JSON 失败: {e}")
 
+    def export_csv(
+        self,
+        records: List[AuditRecord],
+        out_path: Path,
+    ) -> None:
+        out_path = Path(out_path)
+        self._validate_export_path(out_path)
+        try:
+            with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=AUDIT_EXPORT_FIELDNAMES)
+                writer.writeheader()
+                for r in records:
+                    d = r.to_dict()
+                    writer.writerow({
+                        "id": d["id"],
+                        "command_type": d["command_type"],
+                        "operator": d["operator"],
+                        "started_at": d["started_at"],
+                        "finished_at": d["finished_at"] or "",
+                        "duration_seconds": d["duration_seconds"] if d["duration_seconds"] is not None else "",
+                        "result_status": d["result_status"],
+                        "batch_id": d["batch_id"],
+                        "package_names": json.dumps(d["package_names"], ensure_ascii=False),
+                        "file_count": d["file_count"],
+                        "error_count": d["error_count"],
+                        "warning_count": d["warning_count"],
+                        "params_summary": json.dumps(d["params_summary"], ensure_ascii=False),
+                        "config_summary": json.dumps(d["config_summary"], ensure_ascii=False),
+                        "error_summary": d["error_summary"],
+                        "detail_ref": json.dumps(d["detail_ref"], ensure_ascii=False),
+                    })
+        except PermissionError:
+            raise AuditExportError(f"导出失败: 权限不足，无法写入 {out_path}")
+        except OSError as e:
+            raise AuditExportError(f"导出 CSV 失败: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 向后兼容的模块级导出函数（保持现有 audit.py 外部调用接口不变）
+# ---------------------------------------------------------------------------
 
 def export_audit_json(records: List[AuditRecord], out_path: Path) -> None:
-    """导出审计记录为 JSON（字段稳定）"""
-    out_path = Path(out_path)
-    _validate_export_path(out_path)
+    """兼容旧调用：导出审计记录为 JSON"""
+    AuditService._validate_export_path(Path(out_path))
     data = [r.to_dict() for r in records]
     try:
         with open(out_path, "w", encoding="utf-8") as f:
@@ -587,9 +827,8 @@ def export_audit_json(records: List[AuditRecord], out_path: Path) -> None:
 
 
 def export_audit_csv(records: List[AuditRecord], out_path: Path) -> None:
-    """导出审计记录为 CSV（字段稳定，复杂字段用 JSON 序列化）"""
-    out_path = Path(out_path)
-    _validate_export_path(out_path)
+    """兼容旧调用：导出审计记录为 CSV"""
+    AuditService._validate_export_path(Path(out_path))
     try:
         with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=AUDIT_EXPORT_FIELDNAMES)

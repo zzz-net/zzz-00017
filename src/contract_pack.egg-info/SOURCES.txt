@@ -1,8 +1,10 @@
 README.md
 pyproject.toml
 src/contract_pack/__init__.py
+src/contract_pack/audit.py
 src/contract_pack/cli.py
 src/contract_pack/config.py
+src/contract_pack/diff_core.py
 src/contract_pack/engine.py
 src/contract_pack/manifest.py
 src/contract_pack/precheck.py
@@ -15,7 +17,12 @@ src/contract_pack.egg-info/dependency_links.txt
 src/contract_pack.egg-info/entry_points.txt
 src/contract_pack.egg-info/requires.txt
 src/contract_pack.egg-info/top_level.txt
+tests/test_audit_e2e.py
+tests/test_audit_unit.py
+tests/test_diff_e2e.py
+tests/test_diff_unit.py
 tests/test_rerun_e2e.py
+tests/test_rerun_regression.py
 tests/test_rerun_unit.py
 tests/test_rollback.py
 tests/test_template_e2e.py
