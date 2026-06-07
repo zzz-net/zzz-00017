@@ -31,6 +31,8 @@ def batch_to_dict(batch: Batch) -> dict:
                 "error": fa.error,
                 "started_at": fa.started_at,
                 "finished_at": fa.finished_at,
+                "file_hash": fa.file_hash,
+                "file_size": fa.file_size,
             }
             for fa in batch.file_actions
         ],
@@ -49,6 +51,7 @@ def export_csv(batches: List[Batch], out_path: Path) -> None:
     fieldnames = [
         "batch_id",
         "batch_status",
+        "batch_error",
         "operator",
         "started_at",
         "finished_at",
@@ -58,7 +61,9 @@ def export_csv(batches: List[Batch], out_path: Path) -> None:
         "source_path",
         "target_path",
         "file_status",
-        "error",
+        "file_error",
+        "file_hash",
+        "file_size",
     ]
     with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -69,6 +74,7 @@ def export_csv(batches: List[Batch], out_path: Path) -> None:
                     {
                         "batch_id": b.id,
                         "batch_status": b.status,
+                        "batch_error": b.error,
                         "operator": b.operator,
                         "started_at": b.started_at,
                         "finished_at": b.finished_at or "",
@@ -78,7 +84,9 @@ def export_csv(batches: List[Batch], out_path: Path) -> None:
                         "source_path": "",
                         "target_path": "",
                         "file_status": "",
-                        "error": b.error,
+                        "file_error": "",
+                        "file_hash": "",
+                        "file_size": "",
                     }
                 )
             for fa in b.file_actions:
@@ -86,6 +94,7 @@ def export_csv(batches: List[Batch], out_path: Path) -> None:
                     {
                         "batch_id": b.id,
                         "batch_status": b.status,
+                        "batch_error": b.error,
                         "operator": b.operator,
                         "started_at": b.started_at,
                         "finished_at": b.finished_at or "",
@@ -95,6 +104,8 @@ def export_csv(batches: List[Batch], out_path: Path) -> None:
                         "source_path": fa.source_path,
                         "target_path": fa.target_path,
                         "file_status": fa.status,
-                        "error": fa.error,
+                        "file_error": fa.error,
+                        "file_hash": fa.file_hash or "",
+                        "file_size": fa.file_size if fa.file_size is not None else "",
                     }
                 )

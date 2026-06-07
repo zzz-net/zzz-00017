@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import zipfile
 from dataclasses import dataclass
@@ -19,6 +20,16 @@ from .storage import (
     BatchStorage,
     FileAction,
 )
+
+
+def _compute_fingerprint(path: Path) -> Tuple[str, int]:
+    """计算文件 SHA1 哈希和字节大小。用于回滚时确认文件仍为批次产物。"""
+    size = path.stat().st_size
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest(), size
 
 
 @dataclass
@@ -81,7 +92,8 @@ class Engine:
                             raise FileNotFoundError(f"源文件不存在: {src}")
                         tgt.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(src, tgt)
-                        self.storage.update_file_action(fa_id, FILE_STATUS["SUCCESS"])
+                        file_hash, file_size = _compute_fingerprint(tgt)
+                        self.storage.update_file_action(fa_id, FILE_STATUS["SUCCESS"], file_hash=file_hash, file_size=file_size)
                         copied += 1
                     except Exception as e:
                         self.storage.update_file_action(fa_id, FILE_STATUS["FAILED"], error=str(e))
@@ -110,7 +122,8 @@ class Engine:
                                 if f.is_file():
                                     arcname = f.relative_to(output_dir)
                                     zf.write(f, arcname)
-                        self.storage.update_file_action(fa_id, FILE_STATUS["SUCCESS"])
+                        file_hash, file_size = _compute_fingerprint(pkg.zip_output)
+                        self.storage.update_file_action(fa_id, FILE_STATUS["SUCCESS"], file_hash=file_hash, file_size=file_size)
                         result.zipped_files += 1
                     except Exception as e:
                         self.storage.update_file_action(fa_id, FILE_STATUS["FAILED"], error=str(e))
@@ -134,8 +147,50 @@ class Engine:
 
         return result
 
+    def _verify_and_delete(self, fa: FileAction) -> Tuple[bool, str]:
+        """校验目标文件指纹并删除。返回 (是否成功, 错误信息)。
+        成功时已删除；失败时需要调用方决定是否继续。"""
+        tgt = Path(fa.target_path)
+
+        if not tgt.exists():
+            return True, ""
+
+        if tgt.is_dir():
+            label = "zip" if fa.action == FILE_ACTION["ZIP"] else "文件"
+            return False, f"目标路径是目录，无法安全删除: {tgt}"
+
+        if fa.file_hash is None and fa.file_size is None:
+            return False, (
+                f"缺少文件指纹（批次产物，无法确认是否为本批次生成，拒绝删除以防误删: {tgt}"
+            )
+
+        try:
+            cur_hash, cur_size = _compute_fingerprint(tgt)
+        except Exception as e:
+            return False, f"读取目标文件失败: {tgt}: {e}"
+
+        if fa.file_size is not None and cur_size != fa.file_size:
+            return False, (
+                f"文件大小不匹配（疑似被替换），拒绝删除: {tgt} "
+                f"(期望 {fa.file_size} 字节, 当前 {cur_size} 字节)"
+            )
+
+        if fa.file_hash is not None and cur_hash != fa.file_hash:
+            return False, (
+                f"文件内容不匹配（疑似被替换），拒绝删除: {tgt} "
+                f"(期望 sha1={fa.file_hash[:12]}..., 当前 {cur_hash[:12]}...)"
+            )
+
+        try:
+            tgt.unlink()
+        except Exception as e:
+            return False, f"删除目标文件失败 ({tgt}): {e}"
+
+        return True, ""
+
     def rollback(self, batch_id: str) -> Tuple[bool, str]:
-        """回滚指定批次: 只回滚 SUCCESS 动作。若目标路径已被其他文件占用则停止并提示。"""
+        """回滚指定批次: 只回滚 SUCCESS 且指纹匹配的文件动作。
+        遇到内容不匹配、目录占用、zip 被替换等占用情况，立即停止并提示。"""
         batch = self.storage.get_batch(batch_id)
         if not batch:
             return False, f"批次不存在: {batch_id}"
@@ -150,35 +205,13 @@ class Engine:
                 if fa.status != FILE_STATUS["SUCCESS"]:
                     continue
 
-                if fa.action == FILE_ACTION["COPY"]:
-                    tgt = Path(fa.target_path)
-                    if tgt.exists():
-                        if tgt.is_dir():
-                            msg = f"回滚终止: 目标路径是目录且被占用，无法安全删除: {tgt}"
-                            self.storage.update_batch_status(batch.id, BATCH_STATUS["ROLLBACK_FAILED"], error=msg, finished=True)
-                            return False, msg
-                        try:
-                            tgt.unlink()
-                            self.storage.update_file_action(fa.id, FILE_STATUS["ROLLED_BACK"])
-                        except Exception as e:
-                            msg = f"回滚终止: 删除目标文件失败 ({tgt}): {e}"
-                            self.storage.update_batch_status(batch.id, BATCH_STATUS["ROLLBACK_FAILED"], error=msg, finished=True)
-                            return False, msg
-                    else:
-                        self.storage.update_file_action(fa.id, FILE_STATUS["ROLLED_BACK"])
-
-                elif fa.action == FILE_ACTION["ZIP"]:
-                    zp = Path(fa.target_path)
-                    if zp.exists():
-                        try:
-                            zp.unlink()
-                            self.storage.update_file_action(fa.id, FILE_STATUS["ROLLED_BACK"])
-                        except Exception as e:
-                            msg = f"回滚终止: 删除 zip 失败 ({zp}): {e}"
-                            self.storage.update_batch_status(batch.id, BATCH_STATUS["ROLLBACK_FAILED"], error=msg, finished=True)
-                            return False, msg
-                    else:
-                        self.storage.update_file_action(fa.id, FILE_STATUS["ROLLED_BACK"])
+                ok, err = self._verify_and_delete(fa)
+                if not ok:
+                    action_label = "zip" if fa.action == FILE_ACTION["ZIP"] else "copy"
+                    msg = f"回滚终止 (动作={action_label}, 目标={fa.target_path}: {err}"
+                    self.storage.update_batch_status(batch.id, BATCH_STATUS["ROLLBACK_FAILED"], error=msg, finished=True)
+                    return False, msg
+                self.storage.update_file_action(fa.id, FILE_STATUS["ROLLED_BACK"])
 
             for pkg_cfg in self.config.packages:
                 out = pkg_cfg.output_dir

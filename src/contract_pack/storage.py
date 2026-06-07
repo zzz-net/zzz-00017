@@ -51,6 +51,8 @@ class FileAction:
     error: str = ""
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
+    file_hash: Optional[str] = None
+    file_size: Optional[int] = None
 
 
 @dataclass
@@ -122,6 +124,14 @@ class BatchStorage:
                     ON batches(started_at DESC);
                 """
             )
+            self._migrate_schema(c)
+
+    def _migrate_schema(self, c: sqlite3.Connection):
+        cols = {r[1] for r in c.execute("PRAGMA table_info(file_actions)").fetchall()}
+        if "file_hash" not in cols:
+            c.execute("ALTER TABLE file_actions ADD COLUMN file_hash TEXT")
+        if "file_size" not in cols:
+            c.execute("ALTER TABLE file_actions ADD COLUMN file_size INTEGER")
 
     def create_batch(self, operator: str, config_summary: Dict[str, Any]) -> Batch:
         batch = Batch(
@@ -160,23 +170,31 @@ class BatchStorage:
         target_path: str,
         category: str,
         status: str = FILE_STATUS["PENDING"],
+        file_hash: Optional[str] = None,
+        file_size: Optional[int] = None,
     ) -> str:
         fa_id = str(uuid.uuid4())
         with self._conn() as c:
             c.execute(
                 """INSERT INTO file_actions
-                   (id, batch_id, package, action, source_path, target_path, category, status, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (fa_id, batch_id, package, action, source_path, target_path, category, status, _now_iso()),
+                   (id, batch_id, package, action, source_path, target_path, category, status, started_at, file_hash, file_size)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (fa_id, batch_id, package, action, source_path, target_path, category, status, _now_iso(), file_hash, file_size),
             )
         return fa_id
 
-    def update_file_action(self, fa_id: str, status: str, error: str = ""):
+    def update_file_action(self, fa_id: str, status: str, error: str = "", file_hash: Optional[str] = None, file_size: Optional[int] = None):
         with self._conn() as c:
-            c.execute(
-                "UPDATE file_actions SET status=?, error=?, finished_at=? WHERE id=?",
-                (status, error, _now_iso(), fa_id),
-            )
+            if file_hash is not None or file_size is not None:
+                c.execute(
+                    "UPDATE file_actions SET status=?, error=?, finished_at=?, file_hash=COALESCE(?, file_hash), file_size=COALESCE(?, file_size) WHERE id=?",
+                    (status, error, _now_iso(), file_hash, file_size, fa_id),
+                )
+            else:
+                c.execute(
+                    "UPDATE file_actions SET status=?, error=?, finished_at=? WHERE id=?",
+                    (status, error, _now_iso(), fa_id),
+                )
 
     def get_batch(self, batch_id: str) -> Optional[Batch]:
         with self._conn() as c:
@@ -196,22 +214,26 @@ class BatchStorage:
                 "SELECT * FROM file_actions WHERE batch_id=? ORDER BY started_at",
                 (batch_id,),
             ).fetchall()
-            batch.file_actions = [
-                FileAction(
-                    id=r["id"],
-                    batch_id=r["batch_id"],
-                    package=r["package"],
-                    action=r["action"],
-                    source_path=r["source_path"],
-                    target_path=r["target_path"],
-                    category=r["category"],
-                    status=r["status"],
-                    error=r["error"],
-                    started_at=r["started_at"],
-                    finished_at=r["finished_at"],
+            batch.file_actions = []
+            for r in fa_rows:
+                rd = dict(r)
+                batch.file_actions.append(
+                    FileAction(
+                        id=rd["id"],
+                        batch_id=rd["batch_id"],
+                        package=rd["package"],
+                        action=rd["action"],
+                        source_path=rd["source_path"],
+                        target_path=rd["target_path"],
+                        category=rd["category"],
+                        status=rd["status"],
+                        error=rd["error"],
+                        started_at=rd.get("started_at"),
+                        finished_at=rd.get("finished_at"),
+                        file_hash=rd.get("file_hash"),
+                        file_size=rd.get("file_size"),
+                    )
                 )
-                for r in fa_rows
-            ]
             return batch
 
     def list_batches(self, limit: int = 20) -> List[Batch]:

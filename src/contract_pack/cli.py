@@ -168,12 +168,12 @@ def list_batches(ctx: click.Context, config_path: str | None, limit: int):
 
     table = Table(title=f"最近 {len(batches)} 个批次")
     table.add_column("批次 ID", overflow="fold")
-    table.add_column("状态")
+    table.add_column("状态", min_width=15, no_wrap=True)
     table.add_column("操作者")
     table.add_column("开始时间")
     table.add_column("结束时间")
     table.add_column("文件动作")
-    table.add_column("错误")
+    table.add_column("错误", overflow="fold", max_width=40)
     for b in batches:
         sc = {
             BATCH_STATUS["COMPLETED"]: "green",
@@ -226,9 +226,13 @@ def show(ctx: click.Context, config_path: str | None, batch_id: str):
         table.add_column("源路径", overflow="fold")
         table.add_column("目标路径", overflow="fold")
         table.add_column("状态")
-        table.add_column("错误")
+        table.add_column("错误", overflow="fold", max_width=30)
+        table.add_column("大小", max_width=12)
+        table.add_column("指纹 (sha1)", max_width=16)
         for fa in batch.file_actions:
             sc = "green" if fa.status == "success" else ("red" if fa.status == "failed" else "white")
+            hash_display = (fa.file_hash[:12] + "…") if fa.file_hash else "-"
+            size_display = str(fa.file_size) if fa.file_size is not None else "-"
             table.add_row(
                 fa.package,
                 fa.action,
@@ -237,6 +241,8 @@ def show(ctx: click.Context, config_path: str | None, batch_id: str):
                 fa.target_path,
                 f"[{sc}]{fa.status}[/{sc}]",
                 fa.error or "",
+                size_display,
+                hash_display,
             )
         console.print(table)
 
