@@ -358,6 +358,158 @@ def scenario_apply_output_exists(tmpdir: Path):
     assert_eq(out_yaml.read_text(encoding="utf-8") == "OLD_CONTENT", "原有文件未被覆盖")
 
 
+def scenario_export_import_roundtrip_json(tmpdir: Path):
+    """CLI: 导出 JSON -> 清空数据库 -> 导入 JSON -> 验证模板完整（含zip规则）。"""
+    work = setup_workdir(tmpdir, "import_json_roundtrip")
+    run("contract-pack template save 双发方案JSON", cwd=work)
+
+    r0 = run("contract-pack template show 双发方案JSON", cwd=work)
+    assert_eq(r0.returncode == 0, "保存后 show 成功")
+    assert_eq("甲方交付包.zip" in r0.stdout or "甲方交付包" in r0.stdout,
+              "保存的模板含包信息（含 zip）")
+
+    json_out = work / "exported.json"
+    run(f'contract-pack template export -f json -o "{json_out}" 双发方案JSON', cwd=work)
+    assert_eq(json_out.exists(), "JSON 导出文件生成")
+
+    run("contract-pack template delete --force 双发方案JSON", cwd=work)
+    r_del = run("contract-pack template list", cwd=work)
+    assert_eq("暂无保存的模板" in r_del.stdout, "删除后模板列表为空")
+
+    r_imp = run(f'contract-pack template import -f json -i "{json_out}"', cwd=work)
+    assert_eq(r_imp.returncode == 0, "template import JSON 返回 0")
+    assert_eq("导入完成" in r_imp.stdout, "输出包含'导入完成'")
+    assert_eq("双发方案JSON" in r_imp.stdout, "输出包含导入的模板名")
+    assert_eq("zip=" in r_imp.stdout, "输出显示包级 zip 规则")
+
+    r_show = run("contract-pack template show 双发方案JSON", cwd=work)
+    assert_eq(r_show.returncode == 0, "导入后 template show 成功")
+    assert_eq("双发方案JSON" in r_show.stdout, "导入后模板名可见")
+    assert_eq("甲方交付包.zip" in r_show.stdout or "zip_output" in r_show.stdout or "甲方交付包" in r_show.stdout,
+              "导入后模板包配置（含 zip_output）可见")
+
+
+def scenario_export_import_roundtrip_csv(tmpdir: Path):
+    """CLI: 导出 CSV -> 清空 -> 导入 CSV -> 验证完整。"""
+    work = setup_workdir(tmpdir, "import_csv_roundtrip")
+    run("contract-pack template save 双发方案CSV", cwd=work)
+
+    csv_out = work / "exported.csv"
+    run(f'contract-pack template export -f csv -o "{csv_out}" 双发方案CSV', cwd=work)
+    assert_eq(csv_out.exists(), "CSV 导出文件生成")
+
+    run("contract-pack template delete --force 双发方案CSV", cwd=work)
+
+    r_imp = run(f'contract-pack template import -f csv -i "{csv_out}"', cwd=work)
+    assert_eq(r_imp.returncode == 0, "template import CSV 返回 0")
+    assert_eq("双发方案CSV" in r_imp.stdout, "CSV 导入后模板名出现")
+
+    r_show = run("contract-pack template show 双发方案CSV", cwd=work)
+    assert_eq(r_show.returncode == 0, "CSV 导入后 show 成功")
+    assert_eq("乙方交付包" in r_show.stdout, "CSV 导入后乙方包信息可见")
+
+
+def scenario_import_duplicate_skip(tmpdir: Path):
+    """CLI: 导入同名模板默认跳过，--force 覆盖。"""
+    work = setup_workdir(tmpdir, "import_dup")
+    run("contract-pack template save 方案Original", cwd=work)
+
+    json_out = work / "dup.json"
+    run(f'contract-pack template export -f json -o "{json_out}" 方案Original', cwd=work)
+
+    r1 = run(f'contract-pack template import -f json -i "{json_out}"', cwd=work)
+    assert_eq(r1.returncode == 0, "重复名默认跳过返回 0")
+    assert_eq("跳过" in r1.stdout, "输出包含'跳过'")
+
+    r2 = run(f'contract-pack template import -f json -i "{json_out}" --force', cwd=work)
+    assert_eq(r2.returncode == 0, "--force 时返回 0")
+    assert_eq("跳过" not in r2.stdout or "成功 1" in r2.stdout,
+              "--force 时不再跳过，而是成功保存")
+
+
+def scenario_apply_fails_existing_zip(tmpdir: Path):
+    """模板套用时目标 zip 已存在 -> apply 失败，不生成 YAML。"""
+    src_work = setup_workdir(tmpdir, "apply_zip_exist_src")
+    run("contract-pack template save 双发方案", cwd=src_work)
+
+    dst_work = tmpdir / "apply_zip_exist_dst"
+    dst_work.mkdir(parents=True)
+    shutil.copytree(src_work / "sources", dst_work / "sources")
+    shutil.copy(src_work / "manifest.csv", dst_work / "manifest.csv")
+
+    (dst_work / "deliver").mkdir(parents=True)
+    existing_zip = dst_work / "deliver" / "甲方交付包.zip"
+    existing_zip.write_bytes(b"EXISTING ZIP CONTENT")
+    orig_zip_bytes = existing_zip.read_bytes()
+
+    out_yaml = dst_work / "gen.yaml"
+    r = run(
+        f'contract-pack -c "{src_work / "contract_pack.yaml"}" template apply 双发方案 '
+        f'--manifest "{dst_work / "manifest.csv"}" --output "{out_yaml}"',
+        cwd=dst_work,
+    )
+    assert_eq(r.returncode != 0, "zip已存在时 apply 返回非零")
+    assert_eq(not out_yaml.exists(), "zip已存在时不生成半截 YAML 草稿")
+    assert_eq(existing_zip.read_bytes() == orig_zip_bytes,
+              "原有的 zip 文件未被覆盖或修改")
+
+
+def scenario_run_zip_does_not_overwrite(tmpdir: Path):
+    """run --zip 生成 zip 后，再次 run --zip 应该失败（不会覆盖已有 zip）。"""
+    work = tmpdir / "run_zip_no_overwrite"
+    work.mkdir(parents=True)
+
+    src = work / "sources"
+    (src / "contracts").mkdir(parents=True)
+    (src / "contracts" / "main.pdf").write_text("MAIN", encoding="utf-8")
+
+    manifest = work / "manifest.csv"
+    with open(manifest, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["package", "category", "source_path", "target_name", "version", "description"])
+        w.writerow(["甲方交付包", "main", "contracts/main.pdf", "主合同.pdf", "v1", ""])
+
+    cfg = {
+        "operator": "tester",
+        "manifest": "manifest.csv",
+        "source_root": "./sources",
+        "db_path": "./.contract_pack.db",
+        "allow_overwrite": False,
+        "packages": [
+            {
+                "name": "甲方交付包",
+                "output_dir": "./deliver/PartyA",
+                "zip_output": "./deliver/甲方交付包.zip",
+            }
+        ],
+    }
+    with open(work / "contract_pack.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+
+    r1 = run('contract-pack -c contract_pack.yaml run --zip', cwd=work)
+    assert_eq(r1.returncode == 0, "第一次 run --zip 成功")
+
+    zip_path = work / "deliver" / "甲方交付包.zip"
+    assert_eq(zip_path.exists(), "第一次运行后 zip 已生成")
+    first_zip_content = zip_path.read_bytes()
+
+    r2 = run('contract-pack -c contract_pack.yaml run --zip', cwd=work)
+    assert_eq(r2.returncode != 0, "第二次 run --zip 返回非零（zip 已存在预检失败）")
+    assert_eq("预检失败" in r2.stdout or "失败" in r2.stdout,
+              "第二次输出提示预检失败")
+
+    assert_eq(zip_path.read_bytes() == first_zip_content,
+              "第二次 run 失败，原有 zip 内容未被覆盖")
+
+
+def scenario_import_missing_file(tmpdir: Path):
+    """导入不存在的文件 -> CLI 返回非零。"""
+    work = setup_workdir(tmpdir, "import_missing")
+    r = run(f'contract-pack template import -f json -i "{work / "nope.json"}"', cwd=work)
+    assert_eq(r.returncode != 0, "导入不存在文件返回非零")
+    assert_eq("失败" in r.stdout or "不存在" in r.stdout, "错误提示包含原因")
+
+
 def main():
     tmpdir = Path(tempfile.mkdtemp(prefix="contract_pack_tpl_e2e_"))
     print(f"E2E 测试临时目录: {tmpdir}")
@@ -369,6 +521,12 @@ def main():
         scenario_apply_output_conflict(tmpdir)
         scenario_export_cli(tmpdir)
         scenario_apply_output_exists(tmpdir)
+        scenario_export_import_roundtrip_json(tmpdir)
+        scenario_export_import_roundtrip_csv(tmpdir)
+        scenario_import_duplicate_skip(tmpdir)
+        scenario_apply_fails_existing_zip(tmpdir)
+        scenario_run_zip_does_not_overwrite(tmpdir)
+        scenario_import_missing_file(tmpdir)
     except AssertionError:
         pass
 

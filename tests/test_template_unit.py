@@ -25,11 +25,14 @@ from contract_pack.config import PackageConfig
 from contract_pack.template import (
     Template,
     TemplateApplyError,
+    TemplateImportError,
     TemplateNameExistsError,
     TemplateStorage,
     apply_template,
     export_template_csv,
     export_template_json,
+    import_template_csv,
+    import_template_json,
 )
 
 TESTS_PASS = 0
@@ -490,6 +493,10 @@ def test_export_json_and_csv_fields():
                   "来源配置摘要内容正确")
         assert_eq("created_at" in rec and rec["created_at"] == tpl.created_at,
                   "JSON 包含 created_at 且与模板一致")
+        assert_eq("packages" in rec and len(rec["packages"]) == 2,
+                  "JSON 包含 packages 列表")
+        assert_eq(any(p.get("zip_output") for p in rec["packages"]),
+                  "JSON 中 packages 包含 zip_output（包级 zip 规则）")
 
         csv_path = tmpdir / "out.csv"
         export_template_csv([tpl], csv_path)
@@ -498,15 +505,220 @@ def test_export_json_and_csv_fields():
             rows = list(reader)
         assert_eq(len(rows) == 2, f"CSV 有 2 行（每个包一行），实际 {len(rows)}")
         headers = reader.fieldnames or []
-        for h in ("template_name", "created_at", "source_config_summary"):
+        for h in ("template_name", "created_at", "source_config_summary", "zip_output"):
             assert_eq(h in headers, f"CSV 表头包含 {h}")
         assert_eq(all(r["template_name"] == "导出方案" for r in rows),
                   "所有 CSV 行的 template_name 正确")
         assert_eq(all(r["created_at"] == tpl.created_at for r in rows),
                   "所有 CSV 行的 created_at 正确")
-        # 解析第一条的 source_config_summary
+        assert_eq(any(r.get("zip_output") for r in rows),
+                  "CSV 中包含 zip_output 列的值（包级 zip 规则）")
         scs = json.loads(rows[0]["source_config_summary"])
         assert_eq(scs["operator"] == "tester", "CSV 中的 source_config_summary 可解析")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# New pre-check tests
+# ---------------------------------------------------------------------------
+
+def test_apply_zip_already_exists_is_error():
+    """目标 zip 文件已存在 -> ERROR，不生成配置，不污染数据库。"""
+    print("\n=== test_apply_zip_already_exists_is_error ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_apply_zip_exist_"))
+    try:
+        work = tmpdir / "scenario"
+        work.mkdir()
+        manifest = _write_manifest(work)
+        storage = TemplateStorage(work / ".tpl.db")
+        tpl = storage.save_template("方案A", _make_packages(), _make_summary())
+        count_before = len(storage.list_templates())
+
+        deliver = work / "deliver"
+        deliver.mkdir(parents=True)
+        existing_zip = deliver / "甲方交付包.zip"
+        existing_zip.write_bytes(b"OLD ZIP DATA")
+
+        out_yaml = work / "generated.yaml"
+        try:
+            apply_template(tpl, manifest, out_yaml, source_root=Path("./sources"))
+            assert_eq(False, "应抛出 TemplateApplyError（zip 已存在）")
+        except TemplateApplyError as e:
+            assert_eq(not out_yaml.exists(), "失败时不生成半截配置")
+            kinds = {i.kind for i in e.issues}
+            assert_eq("zip_already_exists" in kinds,
+                      "错误类型包含 zip_already_exists")
+            error_kinds = {i.kind for i in e.issues if i.level == "error"}
+            assert_eq("zip_already_exists" in error_kinds,
+                      "zip_already_exists 是 ERROR 级别（不是 WARNING）")
+
+        count_after = len(TemplateStorage(work / ".tpl.db").list_templates())
+        assert_eq(count_before == count_after,
+                  "失败后模板数据库数量不变（不被污染）")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_apply_output_dir_has_content_is_error():
+    """输出目录已存在且非空 -> ERROR，不生成配置。"""
+    print("\n=== test_apply_output_dir_has_content_is_error ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_apply_out_content_"))
+    try:
+        work = tmpdir / "scenario"
+        work.mkdir()
+        manifest = _write_manifest(work)
+        storage = TemplateStorage(work / ".tpl.db")
+        tpl = storage.save_template("方案A", _make_packages(), _make_summary())
+
+        out_dir = work / "deliver" / "PartyA"
+        out_dir.mkdir(parents=True)
+        (out_dir / "existing_file.pdf").write_text("EXISTING", encoding="utf-8")
+
+        out_yaml = work / "generated.yaml"
+        try:
+            apply_template(tpl, manifest, out_yaml, source_root=Path("./sources"))
+            assert_eq(False, "应抛出 TemplateApplyError（输出目录非空）")
+        except TemplateApplyError as e:
+            assert_eq(not out_yaml.exists(), "失败时不生成半截配置")
+            kinds = {i.kind for i in e.issues if i.level == "error"}
+            assert_eq("output_dir_has_content" in kinds,
+                      "错误类型包含 output_dir_has_content")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_apply_new_precheck_failure_db_not_polluted():
+    """新增的预检（zip已存在、目录非空）失败时，数据库不被污染。"""
+    print("\n=== test_apply_new_precheck_failure_db_not_polluted ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_apply_dbclean2_"))
+    try:
+        tpl, manifest, work = _setup_apply_scenario(tmpdir)
+        db = work / ".tpl.db"
+        count_before = len(TemplateStorage(db).list_templates())
+
+        deliver = work / "deliver"
+        deliver.mkdir(parents=True)
+        (deliver / "甲方交付包.zip").write_bytes(b"FAKE")
+
+        out_yaml = work / "generated.yaml"
+        try:
+            apply_template(tpl, manifest, out_yaml, source_root=Path("./sources"))
+        except TemplateApplyError:
+            pass
+
+        count_after = len(TemplateStorage(db).list_templates())
+        assert_eq(count_before == count_after,
+                  "zip已存在预检失败后 DB 模板数量不变")
+        assert_eq(TemplateStorage(db).get_template("方案A") is not None,
+                  "原有模板方案A 仍在数据库中")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Template import tests
+# ---------------------------------------------------------------------------
+
+def test_import_json_roundtrip():
+    """JSON 导出再导入，保留模板名、来源摘要、创建时间和包级 zip 规则。"""
+    print("\n=== test_import_json_roundtrip ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_import_json_"))
+    try:
+        storage = TemplateStorage(tmpdir / "tpl.db")
+        tpl = storage.save_template("导入测试JSON", _make_packages(), _make_summary())
+
+        json_path = tmpdir / "tpl.json"
+        export_template_json([tpl], json_path)
+
+        imported = import_template_json(json_path)
+        assert_eq(len(imported) == 1, "导入了 1 个模板")
+        imp = imported[0]
+        assert_eq(imp.name == "导入测试JSON", "导入后模板名正确")
+        assert_eq(imp.created_at == tpl.created_at, "导入后创建时间保留")
+        assert_eq(imp.source_config_summary.get("operator") == "tester",
+                  "导入后来源配置摘要保留（operator）")
+        assert_eq(len(imp.packages) == 2, "导入后包数量正确")
+        assert_eq(imp.packages[0].name == "甲方交付包", "导入后包名正确")
+        assert_eq(imp.packages[0].zip_output is not None,
+                  "导入后包级 zip_output（zip规则）保留")
+        assert_eq(imp.packages[0].file_mapping.get("main") == "01_主合同",
+                  "导入后 file_mapping 保留")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_import_csv_roundtrip():
+    """CSV 导出再导入，保留模板名、来源摘要、创建时间和包级 zip 规则。"""
+    print("\n=== test_import_csv_roundtrip ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_import_csv_"))
+    try:
+        storage = TemplateStorage(tmpdir / "tpl.db")
+        tpl = storage.save_template("导入测试CSV", _make_packages(), _make_summary())
+
+        csv_path = tmpdir / "tpl.csv"
+        export_template_csv([tpl], csv_path)
+
+        imported = import_template_csv(csv_path)
+        assert_eq(len(imported) == 1, "CSV 导入了 1 个模板")
+        imp = imported[0]
+        assert_eq(imp.name == "导入测试CSV", "CSV 导入后模板名正确")
+        assert_eq(imp.created_at == tpl.created_at, "CSV 导入后创建时间保留")
+        assert_eq(imp.source_config_summary.get("operator") == "tester",
+                  "CSV 导入后来源配置摘要保留")
+        assert_eq(len(imp.packages) == 2, "CSV 导入后包数量正确")
+        assert_eq(any(p.zip_output is not None for p in imp.packages),
+                  "CSV 导入后包级 zip_output（zip规则）保留")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_import_json_missing_file():
+    """导入不存在的 JSON 文件 -> 抛出 TemplateImportError。"""
+    print("\n=== test_import_json_missing_file ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_import_miss_"))
+    try:
+        try:
+            import_template_json(tmpdir / "nope.json")
+            assert_eq(False, "应抛出 TemplateImportError")
+        except TemplateImportError as e:
+            assert_eq("不存在" in str(e), "异常提示文件不存在")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_import_invalid_json():
+    """导入格式错误的 JSON -> 抛出 TemplateImportError。"""
+    print("\n=== test_import_invalid_json ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_import_bad_"))
+    try:
+        bad = tmpdir / "bad.json"
+        bad.write_text("this is not json", encoding="utf-8")
+        try:
+            import_template_json(bad)
+            assert_eq(False, "应抛出 TemplateImportError")
+        except TemplateImportError:
+            assert_eq(True, "格式错误的 JSON 抛出 TemplateImportError")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_import_multiple_templates_json():
+    """JSON 一次导入多个模板。"""
+    print("\n=== test_import_multiple_templates_json ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_import_multi_"))
+    try:
+        storage = TemplateStorage(tmpdir / "tpl.db")
+        tpl1 = storage.save_template("模板一", _make_packages(), _make_summary())
+        tpl2 = storage.save_template("模板二", _make_packages(), _make_summary())
+
+        json_path = tmpdir / "multi.json"
+        export_template_json([tpl1, tpl2], json_path)
+
+        imported = import_template_json(json_path)
+        assert_eq(len(imported) == 2, "一次导入了 2 个模板")
+        names = {t.name for t in imported}
+        assert_eq("模板一" in names and "模板二" in names, "两个模板名都正确导入")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -532,6 +744,14 @@ def main():
         test_apply_failure_db_not_polluted()
         test_apply_skip_dry_run()
         test_export_json_and_csv_fields()
+        test_apply_zip_already_exists_is_error()
+        test_apply_output_dir_has_content_is_error()
+        test_apply_new_precheck_failure_db_not_polluted()
+        test_import_json_roundtrip()
+        test_import_csv_roundtrip()
+        test_import_json_missing_file()
+        test_import_invalid_json()
+        test_import_multiple_templates_json()
     except AssertionError:
         pass
 

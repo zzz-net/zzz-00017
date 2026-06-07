@@ -225,10 +225,10 @@ def run_precheck(config: AppConfig, entries: List[ManifestEntry], storage=None, 
             if pkg.zip_output.exists() and not config.allow_overwrite:
                 result.issues.append(
                     PrecheckIssue(
-                        level="warning",
+                        level="error",
                         kind="zip_exists",
                         package=pkg.name,
-                        message=f"zip 文件已存在",
+                        message=f"zip 文件已存在（会覆盖既有交付包）",
                         detail=str(pkg.zip_output),
                     )
                 )

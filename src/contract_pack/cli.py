@@ -17,12 +17,15 @@ from .report import export_csv, export_json
 from .storage import BATCH_STATUS, BatchStorage
 from .template import (
     TemplateApplyError,
+    TemplateImportError,
     TemplateNameExistsError,
     TemplateNotFoundError,
     TemplateStorage,
     apply_template,
     export_template_csv,
     export_template_json,
+    import_template_csv,
+    import_template_json,
 )
 
 
@@ -505,6 +508,65 @@ def template_export(ctx: click.Context, config_path: str | None, fmt: str, outpu
         console.print(f"[red]导出失败: {e}（可能是只读目录或权限不足）[/red]")
         ctx.exit(1)
     console.print(f"[green]已导出 {len(templates)} 个模板到 {out}[/green]")
+
+
+@template_group.command("import")
+@_config_option
+@click.option("--format", "-f", "fmt", type=click.Choice(["json", "csv"]), default="json", show_default=True, help="导入格式")
+@click.option("--input", "-i", "input_path", required=True, help="输入文件路径")
+@click.option("--force", is_flag=True, help="模板名已存在时覆盖（默认拒绝）")
+@click.pass_context
+def template_import(ctx: click.Context, config_path: str | None, fmt: str, input_path: str, force: bool):
+    """从 JSON 或 CSV 导入模板，保留模板名、来源配置摘要、创建时间和包级 zip 规则"""
+    cfg = _get_cfg(ctx, config_path)
+    storage = TemplateStorage(cfg.db_path)
+    in_file = Path(input_path)
+
+    try:
+        if fmt == "json":
+            imported = import_template_json(in_file)
+        else:
+            imported = import_template_csv(in_file)
+    except TemplateImportError as e:
+        console.print(f"[red]导入失败: {e}[/red]")
+        ctx.exit(7)
+
+    if not imported:
+        console.print("[yellow]文件中没有可导入的模板[/yellow]")
+        ctx.exit(1)
+
+    saved = 0
+    skipped = 0
+    for tpl in imported:
+        existing = storage.get_template(tpl.name)
+        if existing and not force:
+            skipped += 1
+            console.print(f"[yellow]跳过: 模板名 '{tpl.name}' 已存在（使用 --force 覆盖）[/yellow]")
+            continue
+        if existing and force:
+            storage.delete_template(tpl.name)
+        try:
+            storage.save_template(
+                name=tpl.name,
+                packages=tpl.packages,
+                source_config_summary=tpl.source_config_summary,
+            )
+            saved += 1
+        except (TemplateNameExistsError, ValueError) as e:
+            console.print(f"[red]保存模板 '{tpl.name}' 失败: {e}[/red]")
+            ctx.exit(7)
+
+    console.print(f"[green]导入完成: 成功 {saved} 个, 跳过 {skipped} 个[/green]")
+    for t in imported:
+        scs = t.source_config_summary
+        console.print(f"  [bold]{t.name}[/bold] (创建于 {t.created_at}) - {len(t.packages)} 个包")
+        if scs:
+            keys = [k for k in scs.keys() if k != "packages"]
+            if keys:
+                console.print(f"    来源摘要: {', '.join(f'{k}={scs[k]}' for k in keys)}")
+        for pkg in t.packages:
+            zip_note = f", zip={pkg.zip_output}" if pkg.zip_output else ""
+            console.print(f"      - {pkg.name}: output={pkg.output_dir}{zip_note}")
 
 
 @template_group.command("apply")

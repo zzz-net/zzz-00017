@@ -215,11 +215,32 @@ def _validate_package_match(
     return has_errors, issues
 
 
+def _is_parent_writable(p: Path) -> bool:
+    """检查路径的父目录是否可写。若父目录不存在，检查最近存在的祖先。"""
+    try:
+        parent = p.parent
+        while not parent.exists():
+            if parent == parent.parent:
+                break
+            parent = parent.parent
+        if not parent.exists():
+            return True
+        test_file = parent / f"._writable_test_{uuid.uuid4().hex}"
+        try:
+            test_file.write_text("", encoding="utf-8")
+            test_file.unlink()
+            return True
+        except (PermissionError, OSError):
+            return False
+    except Exception:
+        return False
+
+
 def _check_output_path_conflicts(
     packages: List[PackageConfig],
     base_dir: Path,
 ) -> List[PrecheckIssue]:
-    """检查输出目录和 zip 路径冲突及只读问题。"""
+    """检查输出目录和 zip 路径冲突、已有交付包覆盖风险、父路径可写性。"""
     issues: List[PrecheckIssue] = []
     output_dirs: Dict[str, str] = {}
     zip_paths: Dict[str, str] = {}
@@ -242,6 +263,33 @@ def _check_output_path_conflicts(
             )
         output_dirs[out_key] = pkg.name
 
+        if out_dir.exists() and out_dir.is_dir():
+            try:
+                has_contents = any(out_dir.iterdir())
+            except (PermissionError, OSError):
+                has_contents = True
+            if has_contents:
+                issues.append(
+                    PrecheckIssue(
+                        level="error",
+                        kind="output_dir_has_content",
+                        package=pkg.name,
+                        message=f"输出目录已存在且非空（可能覆盖既有交付包）",
+                        detail=str(out_dir),
+                    )
+                )
+
+        if not _is_parent_writable(out_dir):
+            issues.append(
+                PrecheckIssue(
+                    level="error",
+                    kind="output_dir_parent_not_writable",
+                    package=pkg.name,
+                    message=f"输出目录父路径不可写",
+                    detail=str(out_dir.parent),
+                )
+            )
+
         if pkg.zip_output:
             zp = pkg.zip_output
             if not zp.is_absolute():
@@ -262,10 +310,10 @@ def _check_output_path_conflicts(
             if zp.exists() and zp.is_file():
                 issues.append(
                     PrecheckIssue(
-                        level="warning",
+                        level="error",
                         kind="zip_already_exists",
                         package=pkg.name,
-                        message=f"zip 文件已存在",
+                        message=f"zip 文件已存在（会覆盖既有交付包）",
                         detail=str(zp),
                     )
                 )
@@ -278,6 +326,17 @@ def _check_output_path_conflicts(
                         package=pkg.name,
                         message=f"zip 父路径不是目录",
                         detail=str(parent),
+                    )
+                )
+
+            if not _is_parent_writable(zp):
+                issues.append(
+                    PrecheckIssue(
+                        level="error",
+                        kind="zip_parent_not_writable",
+                        package=pkg.name,
+                        message=f"zip 输出父路径不可写",
+                        detail=str(zp.parent),
                     )
                 )
 
@@ -515,3 +574,123 @@ def export_template_csv(templates: List[Template], out_path: Path) -> None:
                         ),
                     }
                 )
+
+
+class TemplateImportError(Exception):
+    """模板导入失败异常"""
+    pass
+
+
+def import_template_json(in_path: Path) -> List[Template]:
+    """从 JSON 文件导入模板列表。"""
+    in_path = Path(in_path)
+    if not in_path.exists():
+        raise TemplateImportError(f"导入文件不存在: {in_path}")
+    try:
+        with open(in_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        raise TemplateImportError(f"读取 JSON 失败: {e}")
+
+    if not isinstance(data, list):
+        raise TemplateImportError("JSON 根节点应为模板列表")
+
+    templates: List[Template] = []
+    for idx, rec in enumerate(data):
+        try:
+            name = rec.get("template_name") or rec.get("name")
+            if not name:
+                raise ValueError(f"第 {idx} 条记录缺少 template_name/name 字段")
+            created_at = rec.get("created_at") or _now_iso()
+            source_config_summary = rec.get("source_config_summary", {}) or {}
+            packages_data = rec.get("packages", []) or []
+            packages = []
+            for pd in packages_data:
+                packages.append(
+                    PackageConfig(
+                        name=pd["name"],
+                        output_dir=Path(pd["output_dir"]),
+                        zip_output=Path(pd["zip_output"]) if pd.get("zip_output") else None,
+                        file_mapping=pd.get("file_mapping", {}),
+                        version=pd.get("version"),
+                    )
+                )
+            templates.append(
+                Template(
+                    name=name,
+                    packages=packages,
+                    source_config_summary=source_config_summary,
+                    created_at=created_at,
+                    id=rec.get("id") or str(uuid.uuid4()),
+                )
+            )
+        except Exception as e:
+            raise TemplateImportError(f"解析第 {idx} 条模板记录失败: {e}")
+    return templates
+
+
+def import_template_csv(in_path: Path) -> List[Template]:
+    """从 CSV 文件导入模板列表。"""
+    in_path = Path(in_path)
+    if not in_path.exists():
+        raise TemplateImportError(f"导入文件不存在: {in_path}")
+    try:
+        with open(in_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+    except (OSError, csv.Error) as e:
+        raise TemplateImportError(f"读取 CSV 失败: {e}")
+
+    grouped: Dict[str, dict] = {}
+    for idx, row in enumerate(rows):
+        try:
+            tpl_name = row.get("template_name") or row.get("name")
+            if not tpl_name:
+                raise ValueError(f"第 {idx} 行缺少 template_name 字段")
+
+            if tpl_name not in grouped:
+                scs_raw = row.get("source_config_summary", "{}") or "{}"
+                try:
+                    scs = json.loads(scs_raw) if scs_raw.strip() else {}
+                except json.JSONDecodeError:
+                    scs = {}
+                grouped[tpl_name] = {
+                    "template_id": row.get("template_id") or str(uuid.uuid4()),
+                    "created_at": row.get("created_at") or _now_iso(),
+                    "source_config_summary": scs,
+                    "packages": [],
+                }
+
+            pkg_name = row.get("package_name")
+            if not pkg_name:
+                continue
+            fm_raw = row.get("file_mapping", "{}") or "{}"
+            try:
+                fm = json.loads(fm_raw) if fm_raw.strip() else {}
+            except json.JSONDecodeError:
+                fm = {}
+            zip_out = row.get("zip_output") or ""
+            grouped[tpl_name]["packages"].append(
+                PackageConfig(
+                    name=pkg_name,
+                    output_dir=Path(row.get("output_dir") or "./deliver/" + pkg_name),
+                    zip_output=Path(zip_out) if zip_out else None,
+                    file_mapping=fm,
+                    version=row.get("package_version") or None,
+                )
+            )
+        except Exception as e:
+            raise TemplateImportError(f"解析第 {idx} 行失败: {e}")
+
+    templates: List[Template] = []
+    for name, info in grouped.items():
+        templates.append(
+            Template(
+                name=name,
+                packages=info["packages"],
+                source_config_summary=info["source_config_summary"],
+                created_at=info["created_at"],
+                id=info["template_id"],
+            )
+        )
+    return templates
