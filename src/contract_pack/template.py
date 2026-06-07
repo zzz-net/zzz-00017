@@ -108,8 +108,14 @@ class TemplateStorage:
         name: str,
         packages: List[PackageConfig],
         source_config_summary: Dict[str, Any],
+        created_at: Optional[str] = None,
+        id: Optional[str] = None,
     ) -> Template:
-        """保存新模板。如果模板名已存在，抛出 TemplateNameExistsError。"""
+        """保存新模板。如果模板名已存在，抛出 TemplateNameExistsError。
+
+        created_at 和 id 可选，用于导入场景保留原始审计数据；
+        不传入则按新建模板处理（当前时间 + 新 UUID）。
+        """
         if not name or not name.strip():
             raise ValueError("模板名不能为空")
 
@@ -124,7 +130,8 @@ class TemplateStorage:
                 name=name,
                 packages=packages,
                 source_config_summary=source_config_summary,
-                created_at=_now_iso(),
+                created_at=created_at or _now_iso(),
+                id=id or str(uuid.uuid4()),
             )
             c.execute(
                 """INSERT INTO templates (id, name, created_at, source_config_summary, packages_data)
@@ -137,7 +144,7 @@ class TemplateStorage:
                     json.dumps(packages_data, ensure_ascii=False),
                 ),
             )
-            logger.info("模板已保存: %s (id=%s)", tpl.name, tpl.id)
+            logger.info("模板已保存: %s (id=%s, created_at=%s)", tpl.name, tpl.id, tpl.created_at)
             return tpl
 
     def list_templates(self) -> List[Template]:

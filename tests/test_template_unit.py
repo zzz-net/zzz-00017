@@ -28,6 +28,7 @@ from contract_pack.template import (
     TemplateImportError,
     TemplateNameExistsError,
     TemplateStorage,
+    _now_iso,
     apply_template,
     export_template_csv,
     export_template_json,
@@ -723,6 +724,198 @@ def test_import_multiple_templates_json():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_import_preserves_created_at_in_db():
+    """导入后数据库 templates.created_at 精确等于导出文件中的时间，不被改写。"""
+    print("\n=== test_import_preserves_created_at_in_db ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_import_ts_"))
+    try:
+        storage1 = TemplateStorage(tmpdir / "tpl1.db")
+        original = storage1.save_template("迁移模板", _make_packages(), _make_summary())
+        original_time = original.created_at
+        original_id = original.id
+
+        json_path = tmpdir / "tpl.json"
+        export_template_json([original], json_path)
+
+        storage2 = TemplateStorage(tmpdir / "tpl2.db")
+        imported_list = import_template_json(json_path)
+        assert_eq(len(imported_list) == 1, "导入 1 个模板")
+        imported = imported_list[0]
+
+        saved = storage2.save_template(
+            name=imported.name,
+            packages=imported.packages,
+            source_config_summary=imported.source_config_summary,
+            created_at=imported.created_at,
+            id=imported.id,
+        )
+        assert_eq(saved.created_at == original_time, f"created_at 保留: {saved.created_at} vs {original_time}")
+        assert_eq(saved.id == original_id, f"id 保留: {saved.id} vs {original_id}")
+
+        with storage2._conn() as c:
+            row = c.execute("SELECT id, created_at FROM templates WHERE name=?", ("迁移模板",)).fetchone()
+            assert_eq(row["created_at"] == original_time, f"数据库 created_at: {row['created_at']} vs 原始 {original_time}")
+            assert_eq(row["id"] == original_id, f"数据库 id: {row['id']} vs 原始 {original_id}")
+
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        file_ts = data[0]["created_at"]
+        assert_eq(file_ts == original_time, f"导出文件时间 {file_ts} 等于原始时间")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_import_without_created_at_falls_back_to_now():
+    """导出文件不带 created_at 字段时，导入使用当前时间，不报错。"""
+    print("\n=== test_import_without_created_at_falls_back_to_now ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_import_no_ts_"))
+    try:
+        storage = TemplateStorage(tmpdir / "tpl.db")
+        tpl = storage.save_template("无时间模板", _make_packages(), _make_summary())
+
+        json_path = tmpdir / "no_ts.json"
+        data = [{
+            "template_name": "无时间模板",
+            "created_at": None,
+            "source_config_summary": _make_summary(),
+            "packages": [p.to_dict() for p in _make_packages()],
+        }]
+        json_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+        imported = import_template_json(json_path)
+        assert_eq(len(imported) == 1, "导入 1 个模板")
+        assert bool(imported[0].created_at), "缺失 created_at 时回退到当前时间"
+
+        storage2 = TemplateStorage(tmpdir / "tpl2.db")
+        saved = storage2.save_template(
+            name=imported[0].name,
+            packages=imported[0].packages,
+            source_config_summary=imported[0].source_config_summary,
+            created_at=imported[0].created_at,
+            id=imported[0].id,
+        )
+        assert_eq(bool(saved.created_at), "保存的模板有 created_at")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_import_duplicate_skip_preserves_existing_created_at():
+    """重复模板默认跳过，数据库中原有模板的 created_at 和 id 不变。"""
+    print("\n=== test_import_duplicate_skip_preserves_existing_created_at ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_import_dup_skip_"))
+    try:
+        storage = TemplateStorage(tmpdir / "tpl.db")
+        existing = storage.save_template("已存在", _make_packages(), _make_summary())
+        existing_ts = existing.created_at
+        existing_id = existing.id
+
+        tpl_other = TemplateStorage(tmpdir / "other.db")
+        other = tpl_other.save_template("已存在", _make_packages(), _make_summary())
+        other_ts = other.created_at
+        other_id = other.id
+        assert existing_ts != other_ts or existing_id != other_id, "两个模板时间/id不同"
+
+        json_path = tmpdir / "other.json"
+        export_template_json([other], json_path)
+        imported = import_template_json(json_path)[0]
+
+        existing_row = storage.get_template("已存在")
+        assert_eq(existing_row.created_at == existing_ts, "跳过重复后 created_at 不变")
+        assert_eq(existing_row.id == existing_id, "跳过重复后 id 不变")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_import_force_overwrite_preserves_imported_created_at():
+    """--force 覆盖时，数据库里写入导入模板的 created_at 和 id，而不是旧的或新生成的。"""
+    print("\n=== test_import_force_overwrite_preserves_imported_created_at ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_import_force_"))
+    try:
+        storage = TemplateStorage(tmpdir / "tpl.db")
+        existing = storage.save_template("覆盖目标", _make_packages(), _make_summary())
+        existing_ts = existing.created_at
+        existing_id = existing.id
+
+        storage2 = TemplateStorage(tmpdir / "other.db")
+        other = storage2.save_template("覆盖目标", _make_packages(), _make_summary())
+        import_ts = other.created_at
+        import_id = other.id
+        assert existing_ts != import_ts or existing_id != import_id, "两个不同来源有不同时间/id"
+
+        json_path = tmpdir / "other.json"
+        export_template_json([other], json_path)
+        imported = import_template_json(json_path)[0]
+
+        storage.delete_template("覆盖目标")
+        saved = storage.save_template(
+            name=imported.name,
+            packages=imported.packages,
+            source_config_summary=imported.source_config_summary,
+            created_at=imported.created_at,
+            id=imported.id,
+        )
+        assert_eq(saved.created_at == import_ts, f"--force 覆盖后 created_at={saved.created_at} == 导入={import_ts}")
+        assert_eq(saved.id == import_id, f"--force 覆盖后 id={saved.id} == 导入={import_id}")
+        assert saved.created_at != existing_ts, "覆盖后不再是旧模板的 created_at"
+
+        with storage._conn() as c:
+            row = c.execute("SELECT id, created_at FROM templates WHERE name=?", ("覆盖目标",)).fetchone()
+            assert_eq(row["created_at"] == import_ts, "数据库 created_at == 导入时间")
+            assert_eq(row["id"] == import_id, "数据库 id == 导入 id")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_save_template_default_generates_new_created_at_and_id():
+    """普通新建模板不传 created_at/id，按当前时间 + 新 UUID 生成（不破坏既有行为）。"""
+    print("\n=== test_save_template_default_generates_new_created_at_and_id ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_default_save_"))
+    try:
+        storage = TemplateStorage(tmpdir / "tpl.db")
+        before = _now_iso()
+        tpl = storage.save_template("新建", _make_packages(), _make_summary())
+        after = _now_iso()
+        assert_eq(bool(tpl.created_at), True, "新模板有 created_at")
+        assert_eq(bool(tpl.id), True, "新模板有 id")
+        assert before <= tpl.created_at <= after, f"时间在 before={before} 和 after={after} 之间: {tpl.created_at}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_csv_import_preserves_created_at_in_db():
+    """CSV 导入后数据库 created_at 和 id 与导出文件一致。"""
+    print("\n=== test_csv_import_preserves_created_at_in_db ===")
+    tmpdir = Path(tempfile.mkdtemp(prefix="tpl_csv_ts_"))
+    try:
+        storage1 = TemplateStorage(tmpdir / "tpl1.db")
+        original = storage1.save_template("CSV迁移", _make_packages(), _make_summary())
+        original_time = original.created_at
+        original_id = original.id
+
+        csv_path = tmpdir / "tpl.csv"
+        export_template_csv([original], csv_path)
+
+        imported_list = import_template_csv(csv_path)
+        assert_eq(len(imported_list) == 1, "CSV 导入 1 个模板")
+        imported = imported_list[0]
+        assert_eq(imported.created_at == original_time, "CSV 解析出的 created_at 与原始一致")
+        assert_eq(imported.id == original_id, "CSV 解析出的 id 与原始一致")
+
+        storage2 = TemplateStorage(tmpdir / "tpl2.db")
+        saved = storage2.save_template(
+            name=imported.name,
+            packages=imported.packages,
+            source_config_summary=imported.source_config_summary,
+            created_at=imported.created_at,
+            id=imported.id,
+        )
+        with storage2._conn() as c:
+            row = c.execute("SELECT id, created_at FROM templates WHERE name=?", ("CSV迁移",)).fetchone()
+            assert_eq(row["created_at"] == original_time, "CSV 导入后数据库 created_at 精确一致")
+            assert_eq(row["id"] == original_id, "CSV 导入后数据库 id 精确一致")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -752,6 +945,12 @@ def main():
         test_import_json_missing_file()
         test_import_invalid_json()
         test_import_multiple_templates_json()
+        test_import_preserves_created_at_in_db()
+        test_import_without_created_at_falls_back_to_now()
+        test_import_duplicate_skip_preserves_existing_created_at()
+        test_import_force_overwrite_preserves_imported_created_at()
+        test_save_template_default_generates_new_created_at_and_id()
+        test_csv_import_preserves_created_at_in_db()
     except AssertionError:
         pass
 

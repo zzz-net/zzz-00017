@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -510,6 +511,138 @@ def scenario_import_missing_file(tmpdir: Path):
     assert_eq("失败" in r.stdout or "不存在" in r.stdout, "错误提示包含原因")
 
 
+def scenario_json_import_db_created_at_consistency(tmpdir: Path):
+    """JSON 导出→导入：导出文件时间 == 数据库时间 == CLI 显示时间（三者一致）。"""
+    work = setup_workdir(tmpdir, "json_ts_consistency")
+    db_path = work / ".contract_pack.db"
+
+    run("contract-pack template save 三一致JSON", cwd=work)
+    r_show0 = run("contract-pack template show 三一致JSON", cwd=work)
+    assert_eq(r_show0.returncode == 0, "保存后 show 成功")
+
+    conn0 = sqlite3.connect(str(db_path))
+    conn0.row_factory = sqlite3.Row
+    row0 = conn0.execute("SELECT id, created_at FROM templates WHERE name=?", ("三一致JSON",)).fetchone()
+    original_ts = row0["created_at"]
+    original_id = row0["id"]
+    conn0.close()
+    assert_eq(bool(original_ts), "原始数据库有 created_at")
+
+    json_out = work / "triple.json"
+    run(f'contract-pack template export -f json -o "{json_out}" 三一致JSON', cwd=work)
+    data = json.loads(json_out.read_text(encoding="utf-8"))
+    file_ts = data[0]["created_at"]
+    file_id = data[0]["id"]
+    assert_eq(file_ts == original_ts, f"JSON 导出文件 created_at == 数据库原始时间: {file_ts}")
+    assert_eq(file_id == original_id, "JSON 导出文件 id == 数据库原始 id")
+
+    run("contract-pack template delete --force 三一致JSON", cwd=work)
+
+    run(f'contract-pack template import -f json -i "{json_out}"', cwd=work)
+    conn1 = sqlite3.connect(str(db_path))
+    conn1.row_factory = sqlite3.Row
+    row1 = conn1.execute("SELECT id, created_at FROM templates WHERE name=?", ("三一致JSON",)).fetchone()
+    db_ts_after = row1["created_at"]
+    db_id_after = row1["id"]
+    conn1.close()
+
+    assert_eq(db_ts_after == original_ts, f"导入后数据库 created_at == 原始时间: {db_ts_after} vs {original_ts}")
+    assert_eq(db_id_after == original_id, "导入后数据库 id == 原始 id")
+    assert_eq(db_ts_after == file_ts, "导入后数据库 created_at == 导出文件时间")
+
+    r_show = run("contract-pack template show 三一致JSON", cwd=work)
+    assert_eq(r_show.returncode == 0, "导入后 show 成功")
+    assert_eq(original_ts in r_show.stdout, "CLI show 输出包含原始 created_at 时间")
+
+
+def scenario_csv_import_db_created_at_consistency(tmpdir: Path):
+    """CSV 导出→导入：导出文件时间 == 数据库时间 == CLI 显示时间（三者一致）。"""
+    work = setup_workdir(tmpdir, "csv_ts_consistency")
+    db_path = work / ".contract_pack.db"
+
+    run("contract-pack template save 三一致CSV", cwd=work)
+
+    conn0 = sqlite3.connect(str(db_path))
+    conn0.row_factory = sqlite3.Row
+    row0 = conn0.execute("SELECT id, created_at FROM templates WHERE name=?", ("三一致CSV",)).fetchone()
+    original_ts = row0["created_at"]
+    original_id = row0["id"]
+    conn0.close()
+
+    csv_out = work / "triple.csv"
+    run(f'contract-pack template export -f csv -o "{csv_out}" 三一致CSV', cwd=work)
+
+    with open(csv_out, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) > 0, "CSV 至少有一行"
+    file_ts = rows[0]["created_at"]
+    file_id = rows[0]["template_id"]
+    assert_eq(file_ts == original_ts, f"CSV 导出文件 created_at == 数据库原始时间: {file_ts}")
+    assert_eq(file_id == original_id, "CSV 导出文件 id == 数据库原始 id")
+
+    run("contract-pack template delete --force 三一致CSV", cwd=work)
+    run(f'contract-pack template import -f csv -i "{csv_out}"', cwd=work)
+
+    conn1 = sqlite3.connect(str(db_path))
+    conn1.row_factory = sqlite3.Row
+    row1 = conn1.execute("SELECT id, created_at FROM templates WHERE name=?", ("三一致CSV",)).fetchone()
+    db_ts_after = row1["created_at"]
+    db_id_after = row1["id"]
+    conn1.close()
+
+    assert_eq(db_ts_after == original_ts, f"CSV 导入后数据库 created_at == 原始时间: {db_ts_after} vs {original_ts}")
+    assert_eq(db_id_after == original_id, "CSV 导入后数据库 id == 原始 id")
+
+    r_show = run("contract-pack template show 三一致CSV", cwd=work)
+    assert_eq(r_show.returncode == 0, "CSV 导入后 show 成功")
+    assert_eq(original_ts in r_show.stdout, "CSV 导入后 CLI show 输出包含原始 created_at 时间")
+
+
+def scenario_import_force_overwrites_db_created_at(tmpdir: Path):
+    """--force 覆盖：数据库里写入导入文件的 created_at/id（不是旧值，也不是新生成的）。"""
+    work = setup_workdir(tmpdir, "import_force_ts")
+    db_path = work / ".contract_pack.db"
+
+    run("contract-pack template save 覆盖验证", cwd=work)
+    import time as _time
+    _time.sleep(1.1)
+
+    other_work = setup_workdir(tmpdir, "import_force_ts_other")
+    run("contract-pack template save 覆盖验证", cwd=other_work)
+    other_db = other_work / ".contract_pack.db"
+    conn_o = sqlite3.connect(str(other_db))
+    conn_o.row_factory = sqlite3.Row
+    row_o = conn_o.execute("SELECT id, created_at FROM templates WHERE name=?", ("覆盖验证",)).fetchone()
+    imported_ts = row_o["created_at"]
+    imported_id = row_o["id"]
+    conn_o.close()
+
+    conn_old = sqlite3.connect(str(db_path))
+    conn_old.row_factory = sqlite3.Row
+    row_old = conn_old.execute("SELECT id, created_at FROM templates WHERE name=?", ("覆盖验证",)).fetchone()
+    old_ts = row_old["created_at"]
+    old_id = row_old["id"]
+    conn_old.close()
+    assert_eq(old_ts != imported_ts or old_id != imported_id, "两个模板时间/id 不一样")
+
+    json_out = other_work / "imp.json"
+    run(f'contract-pack template export -f json -o "{json_out}" 覆盖验证', cwd=other_work)
+
+    r = run(f'contract-pack template import -f json -i "{json_out}" --force', cwd=work)
+    assert_eq(r.returncode == 0, "--force 导入返回 0")
+
+    conn_new = sqlite3.connect(str(db_path))
+    conn_new.row_factory = sqlite3.Row
+    row_new = conn_new.execute("SELECT id, created_at FROM templates WHERE name=?", ("覆盖验证",)).fetchone()
+    db_ts = row_new["created_at"]
+    db_id = row_new["id"]
+    conn_new.close()
+
+    assert_eq(db_ts == imported_ts, f"--force 后 DB created_at={db_ts} == 导入时间={imported_ts}")
+    assert_eq(db_id == imported_id, f"--force 后 DB id={db_id} == 导入 id={imported_id}")
+    assert_eq(db_ts != old_ts, "--force 后 DB 时间不再是旧模板的时间")
+
+
 def main():
     tmpdir = Path(tempfile.mkdtemp(prefix="contract_pack_tpl_e2e_"))
     print(f"E2E 测试临时目录: {tmpdir}")
@@ -527,6 +660,9 @@ def main():
         scenario_apply_fails_existing_zip(tmpdir)
         scenario_run_zip_does_not_overwrite(tmpdir)
         scenario_import_missing_file(tmpdir)
+        scenario_json_import_db_created_at_consistency(tmpdir)
+        scenario_csv_import_db_created_at_consistency(tmpdir)
+        scenario_import_force_overwrites_db_created_at(tmpdir)
     except AssertionError:
         pass
 

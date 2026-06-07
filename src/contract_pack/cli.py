@@ -550,6 +550,8 @@ def template_import(ctx: click.Context, config_path: str | None, fmt: str, input
                 name=tpl.name,
                 packages=tpl.packages,
                 source_config_summary=tpl.source_config_summary,
+                created_at=tpl.created_at,
+                id=tpl.id,
             )
             saved += 1
         except (TemplateNameExistsError, ValueError) as e:
